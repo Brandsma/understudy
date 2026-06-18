@@ -43,6 +43,21 @@ def test_ctrl_q_quits_from_setup():
     assert asyncio.run(run()) is True
 
 
+def test_settings_opens_with_none_provider():
+    """F2 with a skipped/'none' config must not KeyError; it shows 'None Selected'."""
+
+    async def run() -> str:
+        app = UnderstudyApp(config=NO_MODEL)  # provider.kind == "none"
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("f2")
+            await pilot.pause()
+            assert isinstance(app.screen, SetupScreen)
+            return app.screen._current_kind()
+
+    assert asyncio.run(run()) == "none"  # shown as "None Selected", not ollama
+
+
 def test_enter_in_setup_field_saves_and_continues(tmp_path, monkeypatch):
     monkeypatch.setenv("UNDERSTUDY_CONFIG", str(tmp_path / "config.json"))
 

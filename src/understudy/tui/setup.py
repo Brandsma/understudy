@@ -15,14 +15,26 @@ KINDS = [
     ("ollama", "Ollama  (local, private)"),
     ("openai", "OpenAI-compatible API"),
     ("copilot", "GitHub Copilot  (experimental)"),
+    ("none", "None Selected  ·  feed only"),
 ]
-DEFAULT_BASE = {"ollama": "http://localhost:11434", "openai": "https://api.openai.com/v1", "copilot": ""}
-DEFAULT_MODEL = {"ollama": "llama3.1", "openai": "gpt-4o-mini", "copilot": "gpt-4o-mini"}
+DEFAULT_BASE = {
+    "ollama": "http://localhost:11434",
+    "openai": "https://api.openai.com/v1",
+    "copilot": "",
+    "none": "",
+}
+DEFAULT_MODEL = {"ollama": "llama3.1", "openai": "gpt-4o-mini", "copilot": "gpt-4o-mini", "none": ""}
 HINTS = {
     "ollama": "Ollama must be running locally. Use 'Detect models' to list what's installed.",
     "openai": "Works with OpenAI, OpenRouter, vLLM, LM Studio, etc. Base URL should end in /v1.",
     "copilot": "Uses your existing GitHub Copilot login (VS Code / gh / Copilot CLI). Experimental.",
+    "none": "No model: the comprehension chat and live summary are off. The feed and diffs still work.",
 }
+
+
+def _display_kind(kind: str) -> str:
+    """Map a stored kind to a selectable one. Unknown values fall back to 'none'."""
+    return kind if kind in HINTS else "none"
 
 
 class SetupScreen(Screen):
@@ -50,9 +62,10 @@ class SetupScreen(Screen):
                 "Enter in a field saves · Esc skips · Ctrl+Q quits",
                 classes="hint",
             )
+            selected = _display_kind(self.config.provider.kind)
             with RadioSet(id="kind"):
                 for value, label in KINDS:
-                    yield RadioButton(label, value=(value == self.config.provider.kind), id=f"kind-{value}")
+                    yield RadioButton(label, value=(value == selected), id=f"kind-{value}")
             yield Label("Base URL")
             yield Input(value=self.config.provider.base_url, id="base_url")
             yield Label("API key  (blank = use env var / not needed)")
@@ -69,7 +82,7 @@ class SetupScreen(Screen):
 
     def on_mount(self) -> None:
         self.app.sub_title = "setup" if self.first_run else "settings"
-        self._apply_kind(self.config.provider.kind, fill_defaults=False)
+        self._apply_kind(_display_kind(self.config.provider.kind), fill_defaults=False)
         self.query_one("#kind", RadioSet).focus()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -90,9 +103,10 @@ class SetupScreen(Screen):
             base.value = DEFAULT_BASE.get(kind, "")
         if fill_defaults or not model.value:
             model.value = DEFAULT_MODEL.get(kind, "")
-        base.disabled = kind == "copilot"
+        base.disabled = kind in ("copilot", "none")
         key.disabled = kind != "openai"
-        self._status(HINTS[kind], "dim")
+        model.disabled = kind == "none"
+        self._status(HINTS.get(kind, ""), "dim")
 
     def on_radio_set_changed(self, event: RadioSet.Changed) -> None:
         self._apply_kind(self._current_kind(), fill_defaults=True)
