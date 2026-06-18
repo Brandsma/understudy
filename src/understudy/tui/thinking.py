@@ -55,7 +55,7 @@ class ThinkingScreen(Screen):
         ("escape", "back", "Back"),
         ("s", "summarize_all", "Summarize all"),
         ("r", "refresh", "Refresh"),
-        ("q", "quit", "Quit"),
+        ("q", "app.quit", "Quit"),
     ]
 
     def __init__(self, store: EventStore) -> None:

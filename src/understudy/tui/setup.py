@@ -45,6 +45,11 @@ class SetupScreen(Screen):
                 "Ollama keeps everything on your machine.",
                 classes="hint",
             )
+            yield Static(
+                "↑/↓ then Enter to pick a provider · Tab between fields · "
+                "Enter in a field saves · Esc skips · Ctrl+Q quits",
+                classes="hint",
+            )
             with RadioSet(id="kind"):
                 for value, label in KINDS:
                     yield RadioButton(label, value=(value == self.config.provider.kind), id=f"kind-{value}")
@@ -65,6 +70,11 @@ class SetupScreen(Screen):
     def on_mount(self) -> None:
         self.app.sub_title = "setup" if self.first_run else "settings"
         self._apply_kind(self.config.provider.kind, fill_defaults=False)
+        self.query_one("#kind", RadioSet).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in any field submits the wizard, so users don't have to find Save.
+        self._save()
 
     # -- provider-kind reactive fields -------------------------------------- #
 

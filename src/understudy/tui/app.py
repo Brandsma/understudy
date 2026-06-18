@@ -42,7 +42,7 @@ class SessionPicker(Screen):
     BINDINGS = [
         Binding("r", "refresh", "Refresh"),
         Binding("f2", "app.settings", "Settings"),
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
     ]
 
     def __init__(self, cwd_filter: str | None = None) -> None:
@@ -102,7 +102,7 @@ class FeedScreen(Screen):
         Binding("t", "thinking", "Thinking"),
         Binding("p", "toggle_follow", "Follow"),
         Binding("f2", "app.settings", "Settings"),
-        Binding("q", "quit", "Quit"),
+        Binding("q", "app.quit", "Quit"),
     ]
 
     def __init__(self, info: SessionInfo) -> None:
@@ -256,7 +256,13 @@ class FeedScreen(Screen):
 
 class UnderstudyApp(App):
     TITLE = "Understudy"
-    BINDINGS = [Binding("f2", "settings", "Settings")]
+    BINDINGS = [
+        Binding("f2", "settings", "Settings"),
+        # Global, always-available quit — priority so it fires even from text inputs
+        # (the per-screen `q` binding stays for the no-input screens). Works in any
+        # terminal because Textual runs in raw mode (no XON/XOFF flow control).
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+    ]
     CSS = """
     .hint { padding: 1 2; color: $text-muted; }
     .summary {
