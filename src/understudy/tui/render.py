@@ -51,6 +51,9 @@ def _row_body(ev: Event) -> str:
         case Kind.USER_PROMPT | Kind.ASSISTANT_TEXT:
             return _one_line(p.get("text", ""), 110)
         case Kind.THINKING:
+            summary = p.get("summary")
+            if summary:
+                return _one_line(summary, 110)
             text = p.get("text", "")
             return _one_line(text, 110) if text.strip() else "(thinking — content not exposed)"
         case Kind.SESSION_START:

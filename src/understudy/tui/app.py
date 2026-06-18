@@ -28,6 +28,7 @@ from understudy.summary.llm import LiveSummarizer
 from understudy.tui.chat import ChatPanel
 from understudy.tui.render import detail_view, row_text
 from understudy.tui.setup import SetupScreen
+from understudy.tui.thinking import ThinkingScreen
 
 MAX_FEED_ITEMS = 800
 
@@ -98,6 +99,7 @@ class FeedScreen(Screen):
     BINDINGS = [
         Binding("escape", "back", "Back / close chat"),
         Binding("c", "toggle_chat", "Chat"),
+        Binding("t", "thinking", "Thinking"),
         Binding("p", "toggle_follow", "Follow"),
         Binding("f2", "app.settings", "Settings"),
         Binding("q", "quit", "Quit"),
@@ -230,6 +232,9 @@ class FeedScreen(Screen):
         else:
             self.query_one("#feed", ListView).focus()
 
+    def action_thinking(self) -> None:
+        self.app.push_screen(ThinkingScreen(self.store))
+
     def action_back(self) -> None:
         chat = self.query_one(ChatPanel)
         if chat.display:
@@ -274,6 +279,9 @@ class UnderstudyApp(App):
     #chat { height: 45%; display: none; border-top: solid $primary; background: $panel; }
     #chatlog { height: 1fr; padding: 0 1; }
     #chatinput { dock: bottom; }
+
+    #thinking_list { height: 1fr; padding: 0 1; }
+    .think-body { padding: 0 2 1 2; color: $text-muted; }
 
     #setup { padding: 1 2; }
     #setup .title { text-style: bold; padding-bottom: 1; }

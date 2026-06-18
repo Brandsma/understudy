@@ -42,16 +42,21 @@ and see edits/tool-calls appear within ~1 s with correct diffs. **No API key nee
 correct, grounded answer from a live local model — agent undisturbed, fully offline in
 Ollama mode. Copilot token exchange + chat verified live.
 
-## Phase 2 — Thinking-token viewer
+## Phase 2 — Thinking-token viewer  ✅
 
 **Goal:** make reasoning legible without drowning the user.
 
-- [ ] `tui/thinking.py` — collapsible raw view (collapsed by default).
-- [ ] LLM-summarized "thought pattern" header, e.g. *"considered moving X→Y, chose to
-      rename instead"* (the motivating example).
-- [ ] Graceful degradation when thinking text is absent/redacted (show block count +
-      token estimate, not an error). **Validate against the live setup first** — see
-      the thinking caveat in the integration doc.
+- [x] `tui/thinking.py` — dedicated `ThinkingScreen` (open with **t**): one collapsible
+      per thinking block, collapsed by default; **r** refresh, **Esc** back.
+- [x] LLM-summarized "thought pattern" as each block's title — lazily on expand, or in
+      bulk with **s**; cached on the event and reflected in the feed row.
+- [x] Graceful degradation when thinking text is absent/redacted: header shows
+      `N blocks · M with readable text · ~K tokens`, and empty blocks read
+      "content not exposed" rather than erroring.
+
+**Exit criteria:** ✅ opened the thinking viewer on a real session, expanded blocks, and
+got one-line "thought patterns" from a live local model; empty-thinking sessions degrade
+cleanly instead of breaking.
 
 ## Phase 3 — Prove the abstraction: second & third sources
 

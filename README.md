@@ -14,11 +14,12 @@ interrupting, the main agent loop.
 
 ## Status
 
-**Phase 1 built.** Claude Code session auto-discovery → a selectable picker → a live,
-read-only feed with a structured diff viewer, **plus** a comprehension chat and a
-debounced "what & why" summary backed by a pluggable model provider (Ollama,
-OpenAI-compatible, or GitHub Copilot). A first-run wizard and an F2 settings screen
-configure the model. Verified end-to-end against real sessions and a live local model.
+**Phase 2 built.** Claude Code session auto-discovery → a selectable picker → a live,
+read-only feed with a structured diff viewer, a comprehension chat and a debounced
+"what & why" summary backed by a pluggable model provider (Ollama, OpenAI-compatible,
+or GitHub Copilot), **plus** a collapsible thinking-token viewer that distills
+chain-of-thought into one-line "thought patterns". A first-run wizard and an F2 settings
+screen configure the model. Verified end-to-end against real sessions and a live local model.
 
 ## Quickstart
 
@@ -36,7 +37,10 @@ uv run --extra dev pytest -q          # run the test suite
   Copilot login). *Detect models* / *Test* validate it; *Skip* runs feed-only.
 - **Picker:** ↑/↓ move, **Enter** attach, **r** refresh, **q** quit.
 - **Feed:** ↑/↓ inspect an event (drives the diff/detail pane), **c** toggle the
-  comprehension chat, **p** toggle follow-tail, **F2** settings, **Esc** back.
+  comprehension chat, **t** thinking viewer, **p** toggle follow-tail, **F2** settings,
+  **Esc** back.
+- **Thinking viewer (t):** one collapsible per chain-of-thought block; expand for the
+  raw text, **s** to summarize all into one-line "thought patterns", **r** refresh.
 
 It is read-only — it talks only to *its own* model and never touches the agent.
 
