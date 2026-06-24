@@ -8,7 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::context::event_line;
+use crate::filters::strip_think;
+use crate::models::ChatMessage;
 use crate::segments::Segment;
+use crate::store::EventStore;
 
 /// How well a single segment is understood. Ordered Unseen < Skimmed < Understood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +90,172 @@ impl Interactions {
             *slot = state;
         }
     }
+
+    /// Apply Tier-2 question tags: an *inquiry* raises its segments to Understood, a
+    /// *delegation* to at most Skimmed, and *other* is ignored. `n_segments` bounds the
+    /// valid indices (the model may hallucinate).
+    pub fn apply_tags(&mut self, tags: &QuestionTags, n_segments: usize) {
+        let state = match tags.kind {
+            InquiryKind::Inquiry => SegmentState::Understood,
+            InquiryKind::Delegation => SegmentState::Skimmed,
+            InquiryKind::Other => return,
+        };
+        for &idx in &tags.segments {
+            if idx < n_segments {
+                self.set_override(idx, state);
+            }
+        }
+    }
+}
+
+// ---- Tier-2: LLM question tagging (attribution + inquiry/delegation) --------- //
+
+/// How a question engages with the work — the research's inquiry-vs-delegation axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InquiryKind {
+    Inquiry,
+    Delegation,
+    Other,
+}
+
+/// Which segments a question concerns, and how it engages them.
+#[derive(Debug, Clone)]
+pub struct QuestionTags {
+    pub segments: Vec<usize>,
+    pub kind: InquiryKind,
+}
+
+const TAG_SYS: &str =
+    "You classify a question an observer asked while watching a coding agent work.";
+const TAG_PROMPT: &str = "Below is a numbered list of work segments, then a QUESTION. Identify which segment \
+number(s) the question is about, and classify the question as \"inquiry\" (seeking to understand why or how — \
+reasoning, tradeoffs, design), \"delegation\" (asking to produce, change, or fix something), or \"other\". \
+Return ONLY JSON: {\"segments\": [<numbers>], \"kind\": \"inquiry|delegation|other\"}.";
+
+/// Build the tagging prompt for `question` against the current `segments` (0-indexed to
+/// match the array). Exposed so the caller can run it as a detached stream.
+pub fn tag_request(segments: &[Segment], question: &str) -> Vec<ChatMessage> {
+    let listing = segments
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{i}: {}", s.title))
+        .collect::<Vec<_>>()
+        .join("\n");
+    vec![
+        ChatMessage::system(TAG_SYS),
+        ChatMessage::user(format!(
+            "{TAG_PROMPT}\n\n=== SEGMENTS ===\n{listing}\n\n=== QUESTION ===\n{question}"
+        )),
+    ]
+}
+
+/// Parse a tagging reply (tolerant of `<think>`, fences, prose). Returns None if no usable
+/// JSON object is found.
+pub fn parse_tags(raw: &str) -> Option<QuestionTags> {
+    let cleaned = strip_think(raw);
+    let (s, e) = (cleaned.find('{')?, cleaned.rfind('}')?);
+    if e <= s {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        segments: Vec<usize>,
+        #[serde(default)]
+        kind: String,
+    }
+    let r: Raw = serde_json::from_str(&cleaned[s..=e]).ok()?;
+    let kind = match r.kind.to_lowercase().as_str() {
+        "inquiry" => InquiryKind::Inquiry,
+        "delegation" => InquiryKind::Delegation,
+        _ => InquiryKind::Other,
+    };
+    Some(QuestionTags { segments: r.segments, kind })
+}
+
+// ---- Tier-2: explain-back check (the only ~ground-truth comprehension signal) - //
+
+/// Grade of an observer's explain-back answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Pass,
+    Partial,
+    Fail,
+}
+
+/// The events of one segment rendered as a compact transcript (bounded), preserving lines.
+fn segment_activity(store: &EventStore, seg: &Segment) -> String {
+    let end = seg.end_idx.min(store.events.len());
+    let start = seg.start_idx.min(end);
+    let mut text = store.events[start..end]
+        .iter()
+        .map(event_line)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.chars().count() > 4000 {
+        text = text.chars().take(4000).collect();
+    }
+    text
+}
+
+const EXPLAIN_SYS: &str = "You quiz an observer on their understanding of a coding agent's work.";
+const EXPLAIN_PROMPT: &str = "Below is one segment of the agent's activity. Ask the observer ONE concise \
+question that tests whether they understand WHY the agent did this — the reasoning or design choice, not \
+trivia. Output only the question, no preamble.";
+
+/// Prompt the model to pose one "why" question about a segment. The reply is free text.
+pub fn explain_request(store: &EventStore, seg: &Segment) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(EXPLAIN_SYS),
+        ChatMessage::user(format!(
+            "{EXPLAIN_PROMPT}\n\n=== SEGMENT: {} ===\n{}",
+            seg.title,
+            segment_activity(store, seg)
+        )),
+    ]
+}
+
+const GRADE_SYS: &str = "You grade an observer's explanation of a coding agent's work against what actually happened.";
+const GRADE_PROMPT: &str = "Given the segment activity, the question asked, and the observer's answer, judge \
+whether the answer shows genuine understanding of WHY the agent did this. Reply ONLY with JSON: \
+{\"verdict\": \"pass|partial|fail\", \"note\": \"<one short sentence>\"}.";
+
+/// Prompt the model to grade an explain-back answer against the segment's activity.
+pub fn grade_request(store: &EventStore, seg: &Segment, question: &str, answer: &str) -> Vec<ChatMessage> {
+    vec![
+        ChatMessage::system(GRADE_SYS),
+        ChatMessage::user(format!(
+            "{GRADE_PROMPT}\n\n=== SEGMENT: {} ===\n{}\n\n=== QUESTION ===\n{}\n\n=== OBSERVER ANSWER ===\n{}",
+            seg.title,
+            segment_activity(store, seg),
+            question,
+            answer
+        )),
+    ]
+}
+
+/// Parse a grading reply (tolerant of `<think>`, fences, prose).
+pub fn parse_verdict(raw: &str) -> Option<(Verdict, String)> {
+    let cleaned = strip_think(raw);
+    let (s, e) = (cleaned.find('{')?, cleaned.rfind('}')?);
+    if e <= s {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        verdict: String,
+        #[serde(default)]
+        note: String,
+    }
+    let r: Raw = serde_json::from_str(&cleaned[s..=e]).ok()?;
+    let verdict = match r.verdict.to_lowercase().as_str() {
+        "pass" => Verdict::Pass,
+        "partial" => Verdict::Partial,
+        _ => Verdict::Fail,
+    };
+    Some((verdict, r.note))
 }
 
 /// A line-weighted comprehension snapshot over a set of segments.
@@ -251,6 +421,64 @@ mod tests {
         ix.mark_seen(2); // Skimmed from events
         ix.set_override(0, SegmentState::Understood); // Tier-2 wins
         assert_eq!(coverage(&segs, &ix).per_segment[0], SegmentState::Understood);
+    }
+
+    #[test]
+    fn parse_tags_reads_object_and_classifies() {
+        let t = parse_tags("```json\n{\"segments\":[0,2],\"kind\":\"Inquiry\"}\n```").unwrap();
+        assert_eq!(t.segments, vec![0, 2]);
+        assert_eq!(t.kind, InquiryKind::Inquiry);
+        assert_eq!(parse_tags("{\"segments\":[1],\"kind\":\"delegation\"}").unwrap().kind, InquiryKind::Delegation);
+        assert_eq!(parse_tags("{\"segments\":[],\"kind\":\"chitchat\"}").unwrap().kind, InquiryKind::Other);
+        assert!(parse_tags("no json here").is_none());
+    }
+
+    #[test]
+    fn apply_tags_upgrades_by_kind_and_drops_out_of_range() {
+        let segs = [seg(0, 5, 10, 0), seg(5, 9, 6, 0)];
+        let mut ix = Interactions::new();
+        ix.apply_tags(&QuestionTags { segments: vec![0, 99], kind: InquiryKind::Inquiry }, segs.len());
+        ix.apply_tags(&QuestionTags { segments: vec![1], kind: InquiryKind::Delegation }, segs.len());
+        let r = coverage(&segs, &ix);
+        assert_eq!(r.per_segment[0], SegmentState::Understood); // inquiry; index 99 ignored
+        assert_eq!(r.per_segment[1], SegmentState::Skimmed); // delegation caps at skim
+    }
+
+    #[test]
+    fn apply_tags_other_is_ignored() {
+        let segs = [seg(0, 5, 10, 0)];
+        let mut ix = Interactions::new();
+        ix.apply_tags(&QuestionTags { segments: vec![0], kind: InquiryKind::Other }, segs.len());
+        assert_eq!(coverage(&segs, &ix).per_segment[0], SegmentState::Unseen);
+    }
+
+    #[test]
+    fn tag_request_lists_segments_and_question() {
+        let segs = [seg(0, 5, 10, 0)];
+        let msgs = tag_request(&segs, "why this approach?");
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[1].content.contains("=== QUESTION ===") && msgs[1].content.contains("why this approach?"));
+    }
+
+    #[test]
+    fn explain_and_grade_requests_carry_context() {
+        let store = EventStore::new();
+        let s = seg(0, 0, 0, 0);
+        let ex = explain_request(&store, &s);
+        assert_eq!(ex.len(), 2);
+        assert!(ex[1].content.contains("=== SEGMENT"));
+        let gr = grade_request(&store, &s, "why X?", "because Y");
+        assert!(gr[1].content.contains("why X?"));
+        assert!(gr[1].content.contains("because Y"));
+        assert!(gr[1].content.contains("OBSERVER ANSWER"));
+    }
+
+    #[test]
+    fn parse_verdict_reads_all_grades() {
+        assert_eq!(parse_verdict("{\"verdict\":\"pass\",\"note\":\"good\"}").unwrap().0, Verdict::Pass);
+        assert_eq!(parse_verdict("```\n{\"verdict\":\"Partial\"}\n```").unwrap().0, Verdict::Partial);
+        assert_eq!(parse_verdict("{\"verdict\":\"nope\"}").unwrap().0, Verdict::Fail);
+        assert!(parse_verdict("no json at all").is_none());
     }
 
     #[test]

@@ -14,7 +14,10 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use understudy_core::chat::system_with_activity;
-use understudy_core::comprehension::{coverage, Band, CoverageReport, Interactions, SegmentState};
+use understudy_core::comprehension::{
+    coverage, explain_request, grade_request, parse_tags, parse_verdict, tag_request, Band,
+    CoverageReport, Interactions, SegmentState, Verdict,
+};
 use understudy_core::config::load_config;
 use understudy_core::context::{clip, event_line};
 use understudy_core::events::{Event, EventKind, Hunk};
@@ -33,8 +36,8 @@ const WIDE_ROWS: u16 = 12;
 /// Quiet period after the last event before the Tier-2 summary is (re)computed.
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Chat `/help` text.
-const HELP: &str = "commands: /segments  /debt  /follow  /session  /model [name]  /clear  /help  ·  \
-tab: focus a panel  ·  ↑↓: select  ·  esc: unpin → back";
+const HELP: &str = "commands: /segments  /debt  /explain [n]  /tagging  /follow  /session  /model [name]  \
+/clear  /help  ·  tab: focus a panel  ·  ↑↓: select  ·  esc: unpin → back";
 
 enum Mode {
     Picker,
@@ -96,6 +99,32 @@ enum SegMsg {
     Error(String),
 }
 
+/// Raw reply from a Tier-2 question-tagging task (parsed + applied on the UI thread).
+enum TagMsg {
+    Done(String),
+}
+
+/// Replies from the explain-back flow (raw model text, parsed on the UI thread).
+enum ExplainMsg {
+    Question { seg: usize, raw: String },
+    Verdict { seg: usize, raw: String },
+}
+
+/// An in-progress explain-back: the segment and the question the model posed.
+struct Explain {
+    seg: usize,
+    question: String,
+}
+
+/// The senders the key handler routes work onto (bundled to keep signatures small).
+struct Channels {
+    ev: UnboundedSender<Vec<Event>>,
+    chat: UnboundedSender<ChatMsg>,
+    seg: UnboundedSender<SegMsg>,
+    tag: UnboundedSender<TagMsg>,
+    explain: UnboundedSender<ExplainMsg>,
+}
+
 pub struct App {
     mode: Mode,
     sessions: Vec<SessionInfo>,
@@ -112,6 +141,8 @@ pub struct App {
     segments_loading: bool,
     seg_map: Vec<usize>, // listing-line → event-index map for the in-flight request
     interactions: Interactions, // comprehension signals (seen / inquiry / overrides)
+    tagging_enabled: bool,      // Tier-2: LLM-tag each question (opt-in, costs a call)
+    awaiting_explain: Option<Explain>, // explain-back: next chat turn is the answer
     glance_summary: String, // Tier-2 "what & why" (debounced)
     summary_loading: bool,
     summary_dirty: bool, // events changed since the last summary
@@ -146,6 +177,8 @@ impl App {
             segments_loading: false,
             seg_map: Vec::new(),
             interactions: Interactions::new(),
+            tagging_enabled: false,
+            awaiting_explain: None,
             glance_summary: String::new(),
             summary_loading: false,
             summary_dirty: false,
@@ -174,6 +207,7 @@ impl App {
         self.segments_loading = false;
         self.seg_map.clear();
         self.interactions = Interactions::new();
+        self.awaiting_explain = None;
         self.glance_summary.clear();
         self.summary_loading = false;
         self.summary_dirty = false;
@@ -322,14 +356,30 @@ impl App {
     }
 
     /// Dispatch an Enter press: slash commands run locally, everything else is a chat turn.
-    fn submit(&mut self, chat_tx: &UnboundedSender<ChatMsg>, seg_tx: &UnboundedSender<SegMsg>) {
+    fn submit(
+        &mut self,
+        chat_tx: &UnboundedSender<ChatMsg>,
+        seg_tx: &UnboundedSender<SegMsg>,
+        tag_tx: &UnboundedSender<TagMsg>,
+        explain_tx: &UnboundedSender<ExplainMsg>,
+    ) {
         let input = self.chat_input.trim().to_string();
         if input.is_empty() {
             return;
         }
         if !input.starts_with('/') {
-            // A question asked while an event is pinned is attributed to it (Tier-1 inquiry).
-            if let Some(idx) = self.activity_sel {
+            // While an explain-back is open, the next message is the answer to grade.
+            if let Some(ex) = self.awaiting_explain.take() {
+                self.chat_input.clear();
+                self.chat_log.push(ChatEntry::user(input.clone()));
+                self.start_grade(ex.seg, &ex.question, &input, explain_tx);
+                return;
+            }
+            // Attribute the question to segment(s): Tier-2 LLM tagging if enabled, else the
+            // Tier-1 pin-at-ask-time heuristic.
+            if self.tagging_enabled {
+                self.start_tagging(&input, tag_tx);
+            } else if let Some(idx) = self.activity_sel {
                 self.interactions.mark_inquiry(idx);
             }
             self.send_chat(chat_tx);
@@ -342,6 +392,8 @@ impl App {
         match cmd {
             "/segments" => self.start_segmentation(seg_tx),
             "/debt" => self.cmd_debt(),
+            "/explain" => self.start_explain(arg, explain_tx),
+            "/tagging" => self.cmd_tagging(),
             "/session" => self.back_to_picker(),
             "/follow" => {
                 self.activity_sel = None;
@@ -354,6 +406,140 @@ impl App {
                 .chat_log
                 .push(ChatEntry::system(format!("unknown command: {other} (try /help)"))),
         }
+    }
+
+    /// Toggle Tier-2 question tagging.
+    fn cmd_tagging(&mut self) {
+        self.tagging_enabled = !self.tagging_enabled;
+        let state = if self.tagging_enabled {
+            "on — questions are LLM-classified (inquiry vs delegation) per ask"
+        } else {
+            "off — using the pin-at-ask-time heuristic"
+        };
+        self.chat_log.push(ChatEntry::system(format!("question tagging {state}")));
+    }
+
+    /// Run Tier-2 tagging for `question` as a detached stream; applied in `on_tag_msg`.
+    fn start_tagging(&self, question: &str, tx: &UnboundedSender<TagMsg>) {
+        let Some(provider) = self.provider.as_ref() else {
+            return;
+        };
+        if self.segments.is_empty() {
+            return; // nothing to attribute to
+        }
+        let stream = provider.stream_chat(tag_request(&self.segments, question));
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut out = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(d) => out.push_str(&d),
+                    Err(_) => return, // tagging is best-effort; drop on error
+                }
+            }
+            let _ = tx.send(TagMsg::Done(out));
+        });
+    }
+
+    fn on_tag_msg(&mut self, msg: TagMsg) {
+        let TagMsg::Done(raw) = msg;
+        if let Some(tags) = parse_tags(&raw) {
+            self.interactions.apply_tags(&tags, self.segments.len());
+        }
+    }
+
+    /// `/explain [n]` — quiz yourself on a segment (defaults to the least-understood one).
+    /// The model poses a "why" question; your next message is graded against the activity.
+    fn start_explain(&mut self, arg: &str, tx: &UnboundedSender<ExplainMsg>) {
+        let Some(provider) = self.provider.as_ref() else {
+            self.chat_log.push(ChatEntry::system("No model configured — can't run explain-back.".into()));
+            return;
+        };
+        if self.segments.is_empty() {
+            self.chat_log.push(ChatEntry::system("No segments yet — run /segments first.".into()));
+            return;
+        }
+        let seg = if arg.is_empty() {
+            self.least_understood_segment()
+        } else {
+            arg.parse::<usize>().ok().map(|n| n.saturating_sub(1)).filter(|&i| i < self.segments.len())
+        };
+        let Some(seg) = seg else {
+            self.chat_log.push(ChatEntry::system("Nothing left to explain — all segments understood.".into()));
+            return;
+        };
+        let stream = provider.stream_chat(explain_request(&self.store, &self.segments[seg]));
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut out = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(d) => out.push_str(&d),
+                    Err(_) => return,
+                }
+            }
+            let _ = tx.send(ExplainMsg::Question { seg, raw: out });
+        });
+    }
+
+    fn start_grade(&self, seg: usize, question: &str, answer: &str, tx: &UnboundedSender<ExplainMsg>) {
+        let Some(provider) = self.provider.as_ref() else {
+            return;
+        };
+        let Some(segment) = self.segments.get(seg) else {
+            return;
+        };
+        let stream = provider.stream_chat(grade_request(&self.store, segment, question, answer));
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut stream = stream;
+            let mut out = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(d) => out.push_str(&d),
+                    Err(_) => return,
+                }
+            }
+            let _ = tx.send(ExplainMsg::Verdict { seg, raw: out });
+        });
+    }
+
+    fn on_explain_msg(&mut self, msg: ExplainMsg) {
+        match msg {
+            ExplainMsg::Question { seg, raw } => {
+                let q = strip_think(&raw).trim().to_string();
+                if q.is_empty() {
+                    self.chat_log.push(ChatEntry::system("Couldn't generate an explain-back question.".into()));
+                    return;
+                }
+                self.chat_log.push(ChatEntry::system(format!("explain-back · segment {}: {q}", seg + 1)));
+                self.awaiting_explain = Some(Explain { seg, question: q });
+            }
+            ExplainMsg::Verdict { seg, raw } => {
+                let (verdict, note) = parse_verdict(&raw).unwrap_or((Verdict::Partial, String::new()));
+                let label = match verdict {
+                    Verdict::Pass => {
+                        self.interactions.set_override(seg, SegmentState::Understood);
+                        "pass ✓"
+                    }
+                    Verdict::Partial => {
+                        self.interactions.set_override(seg, SegmentState::Skimmed);
+                        "partial"
+                    }
+                    Verdict::Fail => "fail ✗",
+                };
+                let suffix = if note.is_empty() { String::new() } else { format!(" — {note}") };
+                self.chat_log.push(ChatEntry::system(format!("explain-back {label}{suffix}")));
+            }
+        }
+    }
+
+    /// The first segment that isn't yet Understood (the most useful to quiz on).
+    fn least_understood_segment(&self) -> Option<usize> {
+        let report = coverage(&self.segments, &self.interactions);
+        report.per_segment.iter().position(|&s| s != SegmentState::Understood)
     }
 
     /// Print the current Comprehension Coverage breakdown into the chat.
@@ -537,6 +723,9 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
     let (chat_tx, mut chat_rx) = mpsc::unbounded_channel::<ChatMsg>();
     let (sum_tx, mut sum_rx) = mpsc::unbounded_channel::<SummaryMsg>();
     let (seg_tx, mut seg_rx) = mpsc::unbounded_channel::<SegMsg>();
+    let (tag_tx, mut tag_rx) = mpsc::unbounded_channel::<TagMsg>();
+    let (explain_tx, mut explain_rx) = mpsc::unbounded_channel::<ExplainMsg>();
+    let channels = Channels { ev: ev_tx, chat: chat_tx, seg: seg_tx, tag: tag_tx, explain: explain_tx };
     let mut reader = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(200));
 
@@ -549,7 +738,7 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
             maybe = reader.next() => {
                 if let Some(Ok(CEvent::Key(key))) = maybe {
                     if key.kind == KeyEventKind::Press {
-                        handle_key(&mut app, key.code, key.modifiers, &ev_tx, &chat_tx, &seg_tx);
+                        handle_key(&mut app, key.code, key.modifiers, &channels);
                     }
                 }
             }
@@ -563,20 +752,15 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
             Some(msg) = chat_rx.recv() => app.on_chat_msg(msg),
             Some(msg) = sum_rx.recv() => app.on_summary_msg(msg),
             Some(msg) = seg_rx.recv() => app.on_seg_msg(msg),
+            Some(msg) = tag_rx.recv() => app.on_tag_msg(msg),
+            Some(msg) = explain_rx.recv() => app.on_explain_msg(msg),
             _ = tick.tick() => {}
         }
         app.maybe_summarize(&sum_tx);
     }
 }
 
-fn handle_key(
-    app: &mut App,
-    code: KeyCode,
-    mods: KeyModifiers,
-    ev_tx: &UnboundedSender<Vec<Event>>,
-    chat_tx: &UnboundedSender<ChatMsg>,
-    seg_tx: &UnboundedSender<SegMsg>,
-) {
+fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
     // Global quit (works even while typing in the chat input).
     if matches!(code, KeyCode::Char('c') | KeyCode::Char('q')) && mods.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
@@ -588,7 +772,7 @@ fn handle_key(
             KeyCode::Char('q') => app.should_quit = true,
             KeyCode::Up | KeyCode::Char('k') => move_picker(app, -1),
             KeyCode::Down | KeyCode::Char('j') => move_picker(app, 1),
-            KeyCode::Enter => app.attach(ev_tx),
+            KeyCode::Enter => app.attach(&ch.ev),
             _ => {}
         },
         // Chat-first: typing always goes to the input; Tab cycles which panel scrolls.
@@ -606,7 +790,7 @@ fn handle_key(
                     app.back_to_picker();
                 }
             }
-            KeyCode::Enter => app.submit(chat_tx, seg_tx),
+            KeyCode::Enter => app.submit(&ch.chat, &ch.seg, &ch.tag, &ch.explain),
             KeyCode::Backspace => {
                 app.chat_input.pop();
             }
@@ -1326,8 +1510,10 @@ mod tests {
         let mut app = cockpit_app();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.chat_input = "/bogus".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         assert!(app.chat_input.is_empty());
         let last = app.chat_log.last().unwrap();
         assert!(last.role == Role::System && last.text.contains("unknown command"));
@@ -1361,9 +1547,11 @@ mod tests {
         let mut app = cockpit_app();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.segments = vec![fake_segment("a", 0, 3)];
         app.chat_input = "/debt".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         let last = app.chat_log.last().unwrap();
         assert!(last.text.contains("comprehension") && last.text.contains("unread lines"));
     }
@@ -1374,12 +1562,94 @@ mod tests {
         app.provider = None; // avoid spawning a real chat task in a sync test
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.segments = vec![fake_segment("a", 0, 5)];
         app.activity_sel = Some(2); // pinned inside segment 0
         app.chat_input = "what is this doing?".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         let r = coverage(&app.segments, &app.interactions);
         assert_eq!(r.per_segment[0], SegmentState::Understood);
+    }
+
+    #[test]
+    fn tagging_command_toggles() {
+        let mut app = cockpit_app();
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
+        assert!(!app.tagging_enabled);
+        app.chat_input = "/tagging".into();
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
+        assert!(app.tagging_enabled);
+    }
+
+    #[test]
+    fn tag_reply_upgrades_segment_via_overrides() {
+        let mut app = cockpit_app();
+        app.segments = vec![fake_segment("a", 0, 5), fake_segment("b", 5, 9)];
+        app.on_tag_msg(TagMsg::Done("{\"segments\":[1],\"kind\":\"inquiry\"}".into()));
+        let r = coverage(&app.segments, &app.interactions);
+        assert_eq!(r.per_segment[1], SegmentState::Understood);
+    }
+
+    #[test]
+    fn tagging_on_skips_tier1_pin_heuristic() {
+        let mut app = cockpit_app();
+        app.provider = None; // start_tagging + send_chat return early, no task spawned
+        app.tagging_enabled = true;
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.activity_sel = Some(2);
+        app.chat_input = "please refactor this".into();
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
+        // The Tier-1 heuristic is skipped; attribution is left to the (here no-op) tagger.
+        assert_eq!(coverage(&app.segments, &app.interactions).per_segment[0], SegmentState::Unseen);
+    }
+
+    #[test]
+    fn explain_question_opens_awaiting_state() {
+        let mut app = cockpit_app();
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.on_explain_msg(ExplainMsg::Question { seg: 0, raw: "Why did it do this?".into() });
+        assert!(matches!(&app.awaiting_explain, Some(e) if e.seg == 0));
+        assert!(app.chat_log.last().unwrap().text.contains("Why did it do this?"));
+    }
+
+    #[test]
+    fn explain_pass_marks_segment_understood() {
+        let mut app = cockpit_app();
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.on_explain_msg(ExplainMsg::Verdict { seg: 0, raw: "{\"verdict\":\"pass\",\"note\":\"correct\"}".into() });
+        assert_eq!(coverage(&app.segments, &app.interactions).per_segment[0], SegmentState::Understood);
+    }
+
+    #[test]
+    fn explain_answer_routes_to_grading() {
+        let mut app = cockpit_app();
+        app.provider = None; // start_grade returns early; no task spawned
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.awaiting_explain = Some(Explain { seg: 0, question: "why?".into() });
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
+        app.chat_input = "because of X".into();
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
+        assert!(app.awaiting_explain.is_none()); // consumed
+        assert_eq!(app.chat_log.last().unwrap().text, "because of X"); // answer echoed, not sent as a question
+    }
+
+    #[test]
+    fn least_understood_picks_first_non_understood() {
+        let mut app = cockpit_app();
+        app.segments = vec![fake_segment("a", 0, 3), fake_segment("b", 3, 6)];
+        app.interactions.set_override(0, SegmentState::Understood);
+        assert_eq!(app.least_understood_segment(), Some(1));
     }
 
     #[test]
@@ -1387,10 +1657,12 @@ mod tests {
         let mut app = cockpit_app();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.activity_sel = Some(3);
         app.segments_sel = Some(1);
         app.chat_input = "/follow".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         assert!(app.activity_sel.is_none() && app.segments_sel.is_none());
     }
 
@@ -1399,8 +1671,10 @@ mod tests {
         let mut app = cockpit_app();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.chat_input = "/session".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         assert!(matches!(app.mode, Mode::Picker));
     }
 
@@ -1409,8 +1683,10 @@ mod tests {
         let mut app = cockpit_app();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.chat_input = "/model".into();
-        app.submit(&chat_tx, &seg_tx);
+        app.submit(&chat_tx, &seg_tx, &tag_tx, &explain_tx);
         let last = app.chat_log.last().unwrap();
         assert!(last.role == Role::System && (last.text.contains("model:") || last.text.contains("no model")));
     }
@@ -1472,10 +1748,13 @@ mod tests {
         let (ev_tx, _r0) = mpsc::unbounded_channel::<Vec<Event>>();
         let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
         let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        let (tag_tx, _r3) = mpsc::unbounded_channel::<TagMsg>();
+        let (explain_tx, _r4) = mpsc::unbounded_channel::<ExplainMsg>();
         app.active = Some(Panel::Activity);
         app.activity_sel = Some(2);
 
-        let esc = |a: &mut App| handle_key(a, KeyCode::Esc, KeyModifiers::NONE, &ev_tx, &chat_tx, &seg_tx);
+        let ch = Channels { ev: ev_tx, chat: chat_tx, seg: seg_tx, tag: tag_tx, explain: explain_tx };
+        let esc = |a: &mut App| handle_key(a, KeyCode::Esc, KeyModifiers::NONE, &ch);
 
         esc(&mut app); // 1: unfocus panel
         assert!(app.active.is_none() && app.activity_sel.is_some());
