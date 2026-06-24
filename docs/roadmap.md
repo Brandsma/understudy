@@ -94,6 +94,14 @@ for a single static binary and a lean always-on footprint. Planned in two couple
 The Python phases above (0–2 done) stay the working tool until the Rust build reaches
 parity at R5.
 
+## Comprehension Debt KPI (designed, unimplemented)
+
+A best-effort, in-app metric estimating how much of what the agent produced a human has
+actually engaged with and understood — segment-level Comprehension Coverage, surfaced as
+timeline glyphs + a status-bar gauge, with LLM-tagged inquiry attribution and an opt-in
+explain-back check, persisted per session to trend debt over time. Design and research
+grounding are locked in [comprehension-debt-kpi.md](comprehension-debt-kpi.md).
+
 ## The concrete first week
 
 1. **Day 1** — scaffold repo (`uv init`, deps), `events.py`, capture real JSONL

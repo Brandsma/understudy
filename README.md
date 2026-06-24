@@ -118,5 +118,7 @@ docs/            # design docs + the migration/UX plans
   Claude Code adapter spec: storage, JSONL schema, `structuredPatch`, tailing.
 - [docs/providers.md](docs/providers.md) — model providers and config.
 - [docs/ux-redesign.md](docs/ux-redesign.md) — the chat-first cockpit UX being built.
+- [docs/comprehension-debt-kpi.md](docs/comprehension-debt-kpi.md) — the Comprehension Debt
+  KPI design: what it measures, the research grounding, and the locked decisions.
 - [docs/architecture.md](docs/architecture.md) — original system design (conceptual).
 - [docs/roadmap.md](docs/roadmap.md) — phased milestones and history.
