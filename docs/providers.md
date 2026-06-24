@@ -1,8 +1,8 @@
 # Model providers
 
-The comprehension chat and the Tier-2 summary talk to a model through one
-`ModelProvider` protocol ([models/base.py](../src/understudy/models/base.py)).
-Three implementations ship today; all stream over `httpx` (no heavy SDKs).
+The comprehension chat and the Tier-2 summary talk to a model through one `Provider`
+enum ([models/mod.rs](../crates/core/src/models/mod.rs)). Three implementations ship
+today; all stream over `reqwest` (no heavy SDKs).
 
 | Provider | Kind | Where it runs | Auth |
 |---|---|---|---|
@@ -10,8 +10,8 @@ Three implementations ship today; all stream over `httpx` (no heavy SDKs).
 | **OpenAI-compatible** | `openai` | Cloud or local server | Bearer API key (or env) |
 | **GitHub Copilot** *(experimental)* | `copilot` | Cloud | your existing Copilot login |
 
-Pick one in the **first-run wizard**, or change it any time with **F2 → settings**.
-*Detect models* lists available models; *Test* validates connectivity/auth.
+Set `kind` in the config file below (the in-TUI setup wizard is part of the in-progress
+UX). `understudy check` validates connectivity/auth; each provider can list models.
 
 ## Configuration
 
@@ -37,13 +37,13 @@ on macOS, `~/.config/understudy/config.json` on Linux). Override the path with
 - Default base URL `http://localhost:11434`. Keeps the agent's activity entirely
   on your machine — the privacy-preserving default.
 - Reasoning models (qwen3, deepseek-r1) emit `<think>…</think>`; the chat/summary
-  strip these automatically ([models/_filters.py](../src/understudy/models/_filters.py)).
+  strip these automatically ([filters.rs](../crates/core/src/filters.rs)).
 
 ## OpenAI-compatible
 
 - Generic `/v1/chat/completions` + `/v1/models`. Works with OpenAI, OpenRouter,
   Together, vLLM, LM Studio, llama.cpp, etc. Base URL should end in `/v1`.
-- API key from the settings field, or `OPENAI_API_KEY` if the field is blank.
+- API key from the config field, or `OPENAI_API_KEY` if it is blank.
 
 ## GitHub Copilot (experimental)
 
@@ -63,6 +63,7 @@ active Copilot subscription; respect GitHub's terms. Verified working (token exc
 
 ## Adding a provider
 
-Implement the `ModelProvider` protocol (`stream_chat`, `list_models`, `check`, `aclose`)
-and register it in [models/__init__.py](../src/understudy/models/__init__.py)
-`build_provider`. The chat session, summarizer, and settings screen need no changes.
+Add a struct with `stream_chat`, `list_models`, and `check`, a variant to the `Provider`
+enum, and a branch in `build_provider` — all in
+[models/mod.rs](../crates/core/src/models/mod.rs). The chat, summarizer, and CLI need no
+changes (a thin SSE/NDJSON parser in `models/http.rs` is reused).

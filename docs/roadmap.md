@@ -77,6 +77,23 @@ cleanly instead of breaking.
 - [ ] Config file (model, redaction rules, panes, key bindings).
 - [ ] Packaging: `uv`/`pipx`-installable; `understudy` console script.
 
+## v2 — chat-first cockpit + Rust rewrite
+
+A larger track that **supersedes Phase 4's polish/distribution**: redesign the UX into a
+chat-first, multi-panel comprehension cockpit and rewrite the codebase in Rust + ratatui
+for a single static binary and a lean always-on footprint. Planned in two coupled docs:
+
+- [ux-redesign.md](ux-redesign.md) — the target experience (implementation-agnostic):
+  persistent chat spine, live Glance/Activity/Thinking/Detail panels, session
+  at-a-glance, slash commands + command palette.
+- [rust-migration.md](rust-migration.md) — the staged port (R0–R5): domain `core` first
+  (headless, golden-tested against the same fixtures), then the ratatui cockpit, then
+  cutover. Honest framing of the trade-offs (the real win is distribution/footprint, not
+  raw speed).
+
+The Python phases above (0–2 done) stay the working tool until the Rust build reaches
+parity at R5.
+
 ## The concrete first week
 
 1. **Day 1** — scaffold repo (`uv init`, deps), `events.py`, capture real JSONL

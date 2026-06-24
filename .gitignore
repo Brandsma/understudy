@@ -1,20 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-dist/
-build/
-
-# uv
-.uv/
-uv.lock
-
-# tooling
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
+# Rust
+/target/
+**/*.rs.bk
 
 # OS
 .DS_Store

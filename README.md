@@ -9,55 +9,68 @@ did at the very end, via a model-generated summary. Instead you can watch and
 *interrogate* the process as it unfolds — without ever sending a message to, or
 interrupting, the main agent loop.
 
-> Understudy is a passive observer. It reads the agent's activity
-> stream and talks to its *own* model. The main session never knows it exists.
+> Understudy is a passive observer. It reads the agent's activity stream and talks
+> to its *own* model. The main session never knows it exists.
+
+**Stack:** Rust + [ratatui](https://ratatui.rs) (single static binary). Async via
+tokio; providers over `reqwest`. *(Migrated from the original Python/Textual
+prototype — see [docs/rust-migration.md](docs/rust-migration.md).)*
 
 ## Status
 
-**Phase 2 built.** Claude Code session auto-discovery → a selectable picker → a live,
-read-only feed with a structured diff viewer, a comprehension chat and a debounced
-"what & why" summary backed by a pluggable model provider (Ollama, OpenAI-compatible,
-or GitHub Copilot), **plus** a collapsible thinking-token viewer that distills
-chain-of-thought into one-line "thought patterns". A first-run wizard and an F2 settings
-screen configure the model. Verified end-to-end against real sessions and a live local model.
+The **core is complete and verified** — Claude Code session discovery + JSONL
+tailing + normalization, the model-provider layer (Ollama / OpenAI-compatible /
+GitHub Copilot), `<think>` filtering, and the deterministic + LLM summaries — with
+golden tests over real fixtures. The **TUI** has a session picker, a live
+color-coded activity feed with the Tier-1 summary, and a **streaming comprehension
+chat**. Remaining UX (thinking viewer, settings wizard, the full cockpit) is in
+progress; see [docs/rust-migration.md](docs/rust-migration.md).
 
 ## Quickstart
 
 ```bash
-uv sync                 # install deps (textual, httpx, platformdirs)
-uv run understudy       # first run → model setup → pick a session → watch it live
-# options:
-uv run understudy --here              # only sessions for the current directory
-uv run understudy --session <uuid>    # skip the picker, attach directly
-uv run --extra dev pytest -q          # run the test suite
+cargo run                          # launch the TUI: pick a session → live feed + chat
+cargo build --release              # produce ./target/release/understudy
+
+# headless subcommands
+understudy sessions                # list discovered Claude Code sessions
+understudy tail   [--here] [--session <uuid|path>]   # stream normalized events
+understudy ask "what is it doing?" [--here]          # one-shot comprehension answer
+understudy check                   # validate the configured model provider
+
+cargo test                         # run the suite (core parity + TUI render tests)
 ```
 
-- **First run** opens a setup wizard: choose **Ollama** (local/private), an
-  **OpenAI-compatible API**, or **GitHub Copilot** (experimental, reuses your existing
-  Copilot login). *Detect models* / *Test* validate it; *Skip* runs feed-only.
-- **Picker:** ↑/↓ move, **Enter** attach, **r** refresh, **q** quit.
-- **Feed:** ↑/↓ inspect an event (drives the diff/detail pane), **c** toggle the
-  comprehension chat, **t** thinking viewer, **p** toggle follow-tail, **F2** settings,
-  **Esc** back.
-- **Thinking viewer (t):** one collapsible per chain-of-thought block; expand for the
-  raw text, **s** to summarize all into one-line "thought patterns", **r** refresh.
+- **Picker:** ↑/↓ select · **Enter** attach · **^q** quit.
+- **Feed:** ↑/↓ · PgUp/PgDn scroll · **g/G** top/bottom · **c** (or `/`) chat ·
+  **Esc** back to picker · **^q** quit.
+- **Chat:** type to ask · **Enter** send · **Esc** close · **^q** quit. Questions
+  carry the live activity stream + conversation history as context; answers stream in.
 
 It is read-only — it talks only to *its own* model and never touches the agent.
 
-## Decisions locked in
+## Configuring the model
 
-| Decision | Choice | Why |
-|---|---|---|
-| Language / TUI | **Python + [Textual](https://textual.textualize.io/)** | Fastest path to a rich multi-pane TUI; async-native; `httpx` for provider streaming |
-| Comprehension model | **Pluggable, cloud + local from day one** | A `ModelProvider` seam over **Ollama**, **OpenAI-compatible** APIs, and **GitHub Copilot**; chosen in setup / settings. Local keeps activity on-device |
-| First integration | **Claude Code** | Verified feasible & zero-config (see below) |
-| Integration posture | **Read-only, zero-config** | Tail the on-disk activity log; never touch the agent |
+Config lives at the platform config dir (`~/Library/Application Support/understudy/config.json`
+on macOS, `~/.config/understudy/config.json` on Linux), overridable with
+`UNDERSTUDY_CONFIG`. Shape:
+
+```json
+{ "provider": { "kind": "ollama", "base_url": "http://localhost:11434",
+                "api_key": "", "model": "qwen3:4b", "temperature": 0.3 },
+  "configured": true }
+```
+
+`kind` is `ollama` | `openai` | `copilot` | `none`. For `openai`, `api_key` falls back
+to `$OPENAI_API_KEY`; for `copilot`, an existing Copilot login (VS Code / `gh` / Copilot
+CLI, or `$COPILOT_GITHUB_TOKEN`) is used. Details: [docs/providers.md](docs/providers.md).
+*(The in-TUI setup wizard is part of the in-progress UX; until then, edit this file.)*
 
 ## Why this is feasible (verified against real data)
 
 The hard question was *"how do you tap the activity stream without interrupting the
-agent?"* It turns out every priority target is passively observable, and the
-integration collapses to **one small adapter each**:
+agent?"* Every priority target is passively observable, and the integration collapses
+to **one small adapter each**:
 
 | Target | Mechanism | Source of truth |
 |---|---|---|
@@ -65,27 +78,17 @@ integration collapses to **one small adapter each**:
 | **Copilot CLI** | Tail append-only JSONL | `~/.copilot/session-state/<session>/events.jsonl` |
 | **OpenCode** | Subscribe to SSE | server `/event` stream |
 
-Inspecting real Claude Code transcripts confirmed the data we need is already there:
-
-- **Diffs are free** — every Edit/Write result ships a `structuredPatch` (ready-made
-  unified-diff hunks) plus the original file and old/new strings. The diff viewer
-  computes nothing.
-- **Thinking text is present** in most sessions (one session had 331 readable
-  thinking blocks). ⚠️ *Best-effort:* it was empty in some sessions, so availability
-  varies by model/version/config and must be validated against the live setup.
-- **Structure is recoverable** — entries form a `parentUuid` linked list with
-  `isSidechain` flags, so turn boundaries and subagent sidechains can be
-  reconstructed.
-
-Full detail in [docs/claude-code-integration.md](docs/claude-code-integration.md).
+From real Claude Code transcripts: **diffs are free** (every Edit/Write ships a
+`structuredPatch`), **thinking text is usually present** (best-effort — empty in some
+sessions), and structure is recoverable via `parentUuid` + `isSidechain`. Full detail in
+[docs/claude-code-integration.md](docs/claude-code-integration.md).
 
 ## The core architectural bet
 
-Two of three targets are *tailable event logs* and the third is a push stream.
-So the whole app is built around **one normalized `Event` model and a `Source`
-adapter interface**. Claude Code is just the first adapter; the event store,
-summary engine, comprehension chat, and TUI are all source-agnostic. This makes
-the multi-tool roadmap nearly free.
+Two of three targets are *tailable event logs* and the third is a push stream, so the
+whole app is built around **one normalized `Event` model and a source adapter**. Claude
+Code is the first adapter; the event store, summaries, chat, and TUI are all
+source-agnostic.
 
 ```
 Source adapter (tail JSONL / SSE) → Event normalizer → Event store + rolling window
@@ -96,25 +99,24 @@ Source adapter (tail JSONL / SSE) → Event normalizer → Event store + rolling
          └──────────────────── TUI: [feed] [summary] [diff] [thinking] [chat] ───────────┘
 ```
 
+## Repo layout
+
+```
+crates/
+  core/          # lib: events, store, context, filters, config, chat,
+                 #      sources/claude_code, models/{ollama,openai,copilot}, summary
+  understudy/    # bin: CLI (sessions/tail/ask/check) + the ratatui TUI
+fixtures/        # real JSONL transcripts used by the golden tests
+docs/            # design docs + the migration/UX plans
+```
+
 ## Documentation
 
-- [docs/architecture.md](docs/architecture.md) — system design: source-adapter
-  pattern, normalized event model, pipeline, components, model layer, TUI, repo layout.
+- [docs/rust-migration.md](docs/rust-migration.md) — the Rust/ratatui architecture,
+  crate choices, module map, phased status, and testing.
 - [docs/claude-code-integration.md](docs/claude-code-integration.md) — the verified
-  Claude Code adapter spec: storage, JSONL schema, `structuredPatch`, session
-  discovery, tailing strategy, optional hooks.
-- [docs/providers.md](docs/providers.md) — model providers: Ollama, OpenAI-compatible,
-  and GitHub Copilot; config file location, env vars, and the Copilot caveats.
-- [docs/roadmap.md](docs/roadmap.md) — phased milestones, the concrete first slice,
-  risks, and open questions.
-
-## Roadmap at a glance
-
-- **Phase 0 — MVP:** ✅ Claude Code tail adapter + event store + live feed pane + diff
-  viewer. No LLM. Read-only stream proven end-to-end (incl. session picker).
-- **Phase 1:** ✅ Comprehension chat + debounced LLM summary over a pluggable provider
-  (Ollama / OpenAI-compatible / Copilot), first-run wizard + settings.
-- **Phase 2:** Collapsible thinking-token viewer with summarized "thought patterns."
-- **Phase 3:** Second adapter (OpenCode SSE — easiest) to prove the abstraction; then
-  Copilot CLI.
-- **Phase 4:** Polish — sidechains, session switching, packaging, config.
+  Claude Code adapter spec: storage, JSONL schema, `structuredPatch`, tailing.
+- [docs/providers.md](docs/providers.md) — model providers and config.
+- [docs/ux-redesign.md](docs/ux-redesign.md) — the chat-first cockpit UX being built.
+- [docs/architecture.md](docs/architecture.md) — original system design (conceptual).
+- [docs/roadmap.md](docs/roadmap.md) — phased milestones and history.
