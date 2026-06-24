@@ -14,6 +14,7 @@ use ratatui::DefaultTerminal;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use understudy_core::chat::system_with_activity;
+use understudy_core::comprehension::{coverage, Band, CoverageReport, Interactions, SegmentState};
 use understudy_core::config::load_config;
 use understudy_core::context::{clip, event_line};
 use understudy_core::events::{Event, EventKind, Hunk};
@@ -32,7 +33,7 @@ const WIDE_ROWS: u16 = 12;
 /// Quiet period after the last event before the Tier-2 summary is (re)computed.
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Chat `/help` text.
-const HELP: &str = "commands: /segments  /follow  /session  /model [name]  /clear  /help  ·  \
+const HELP: &str = "commands: /segments  /debt  /follow  /session  /model [name]  /clear  /help  ·  \
 tab: focus a panel  ·  ↑↓: select  ·  esc: unpin → back";
 
 enum Mode {
@@ -110,6 +111,7 @@ pub struct App {
     segments_sel: Option<usize>,
     segments_loading: bool,
     seg_map: Vec<usize>, // listing-line → event-index map for the in-flight request
+    interactions: Interactions, // comprehension signals (seen / inquiry / overrides)
     glance_summary: String, // Tier-2 "what & why" (debounced)
     summary_loading: bool,
     summary_dirty: bool, // events changed since the last summary
@@ -143,6 +145,7 @@ impl App {
             segments_sel: None,
             segments_loading: false,
             seg_map: Vec::new(),
+            interactions: Interactions::new(),
             glance_summary: String::new(),
             summary_loading: false,
             summary_dirty: false,
@@ -170,6 +173,7 @@ impl App {
         self.segments_sel = None;
         self.segments_loading = false;
         self.seg_map.clear();
+        self.interactions = Interactions::new();
         self.glance_summary.clear();
         self.summary_loading = false;
         self.summary_dirty = false;
@@ -243,8 +247,9 @@ impl App {
             return;
         }
         let cur = self.activity_sel.map(|i| i as i32).unwrap_or(total as i32 - 1);
-        let next = (cur + delta).clamp(0, total as i32 - 1);
-        self.activity_sel = Some(next as usize);
+        let next = (cur + delta).clamp(0, total as i32 - 1) as usize;
+        self.activity_sel = Some(next);
+        self.interactions.mark_seen(next); // selecting a row shows it in Detail = read
     }
 
     /// Move the segment selection and jump the feed to that segment's first event.
@@ -259,7 +264,9 @@ impl App {
             Some(i) => (i as i32 + delta).clamp(0, n - 1) as usize,
         };
         self.segments_sel = Some(next);
-        self.activity_sel = Some(self.segments[next].start_idx);
+        let start = self.segments[next].start_idx;
+        self.activity_sel = Some(start);
+        self.interactions.mark_seen(start); // jumping to a segment counts as skimming it
     }
 
     /// Build the `/segments` request and run the LLM call as a detached stream. Segments
@@ -321,6 +328,10 @@ impl App {
             return;
         }
         if !input.starts_with('/') {
+            // A question asked while an event is pinned is attributed to it (Tier-1 inquiry).
+            if let Some(idx) = self.activity_sel {
+                self.interactions.mark_inquiry(idx);
+            }
             self.send_chat(chat_tx);
             return;
         }
@@ -330,6 +341,7 @@ impl App {
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/segments" => self.start_segmentation(seg_tx),
+            "/debt" => self.cmd_debt(),
             "/session" => self.back_to_picker(),
             "/follow" => {
                 self.activity_sel = None;
@@ -342,6 +354,23 @@ impl App {
                 .chat_log
                 .push(ChatEntry::system(format!("unknown command: {other} (try /help)"))),
         }
+    }
+
+    /// Print the current Comprehension Coverage breakdown into the chat.
+    fn cmd_debt(&mut self) {
+        if self.segments.is_empty() {
+            self.chat_log.push(ChatEntry::system("No segments yet — run /segments first.".into()));
+            return;
+        }
+        let r = coverage(&self.segments, &self.interactions);
+        let msg = format!(
+            "comprehension {}% (est.) · {} of {} segments unreviewed · {} unread lines",
+            r.percent(),
+            r.unreviewed_segments,
+            self.segments.len(),
+            r.unread_lines
+        );
+        self.chat_log.push(ChatEntry::system(msg));
     }
 
     /// `/model` reports the current model; `/model <name>` switches it live (same
@@ -642,7 +671,10 @@ fn draw_cockpit(f: &mut Frame, app: &App) {
     ])
     .split(f.area());
 
-    draw_status(f, app, v[0]);
+    // Comprehension Coverage is only meaningful once segments exist.
+    let report = (!app.segments.is_empty()).then(|| coverage(&app.segments, &app.interactions));
+
+    draw_status(f, app, v[0], report.as_ref());
 
     let body = v[1];
     if body.width >= WIDE_COLS && body.height >= WIDE_ROWS {
@@ -654,7 +686,7 @@ fn draw_cockpit(f: &mut Frame, app: &App) {
         .split(body);
         let left = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(cols[0]);
         draw_glance(f, app, left[0]);
-        draw_segments(f, app, left[1]);
+        draw_segments(f, app, left[1], report.as_ref());
         draw_activity(f, app, cols[1]);
         let right = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(cols[2]);
         draw_thinking(f, app, right[0]);
@@ -682,7 +714,7 @@ fn panel_block(title: &str, active: bool) -> Block<'static> {
         .title(format!(" {title} "))
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
+fn draw_status(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageReport>) {
     let proj = if app.title.is_empty() { "session".to_string() } else { app.title.clone() };
     let branch = if app.branch.is_empty() { String::new() } else { format!("@{}", app.branch) };
     let model = match &app.provider {
@@ -697,7 +729,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         ("○ idle", Color::DarkGray)
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(" Understudy ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(format!("{proj}{branch}"), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -705,8 +737,21 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("{} events", app.store.events.len()), Style::default().fg(Color::DarkGray)),
         Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
         Span::styled(dot, Style::default().fg(dot_color)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    // Comprehension Coverage gauge, colored by the research bands.
+    spans.push(Span::styled("  ·  ", Style::default().fg(Color::DarkGray)));
+    match report {
+        Some(r) => {
+            let color = match r.band() {
+                Band::Low => Color::Red,
+                Band::Mid => Color::Yellow,
+                Band::High => Color::Green,
+            };
+            spans.push(Span::styled(format!("comp {}% (est.)", r.percent()), Style::default().fg(color)));
+        }
+        None => spans.push(Span::styled("comp —  /segments", Style::default().fg(Color::DarkGray))),
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn draw_glance(f: &mut Frame, app: &App, area: Rect) {
@@ -767,7 +812,7 @@ fn draw_glance(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
-fn draw_segments(f: &mut Frame, app: &App, area: Rect) {
+fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageReport>) {
     let block = panel_block("Segments", app.active == Some(Panel::Segments));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -786,13 +831,15 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let width = inner.width.saturating_sub(3) as usize;
+    let width = inner.width.saturating_sub(5) as usize;
     let items: Vec<ListItem> = app
         .segments
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let state = report.and_then(|r| r.per_segment.get(i).copied()).unwrap_or(SegmentState::Unseen);
             let line = Line::from(vec![
+                Span::styled(format!("{} ", state.glyph()), Style::default().fg(state_color(state))),
                 Span::styled(format!("{} ", i + 1), Style::default().fg(Color::DarkGray)),
                 Span::raw(truncate(&s.title, width)),
             ]);
@@ -1109,6 +1156,14 @@ fn basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+fn state_color(state: SegmentState) -> Color {
+    match state {
+        SegmentState::Unseen => Color::DarkGray,
+        SegmentState::Skimmed => Color::Yellow,
+        SegmentState::Understood => Color::Green,
+    }
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
@@ -1276,6 +1331,55 @@ mod tests {
         assert!(app.chat_input.is_empty());
         let last = app.chat_log.last().unwrap();
         assert!(last.role == Role::System && last.text.contains("unknown command"));
+    }
+
+    #[test]
+    fn comprehension_gauge_placeholder_then_percent() {
+        let mut app = cockpit_app();
+        let mut t = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        t.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(buffer_text(t.backend().buffer()).contains("/segments")); // placeholder, no segments
+
+        app.segments = vec![fake_segment("a", 0, app.store.events.len())];
+        let mut t2 = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        t2.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(buffer_text(t2.backend().buffer()).contains("(est.)")); // gauge with a percent
+    }
+
+    #[test]
+    fn segment_glyph_reflects_state() {
+        let mut app = cockpit_app();
+        app.segments = vec![fake_segment("alpha", 0, 5)];
+        app.interactions.mark_inquiry(2); // inside segment 0 → Understood
+        let mut t = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        t.draw(|f| ui(f, &mut app)).unwrap();
+        assert!(buffer_text(t.backend().buffer()).contains('●'));
+    }
+
+    #[test]
+    fn debt_command_reports_coverage() {
+        let mut app = cockpit_app();
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        app.segments = vec![fake_segment("a", 0, 3)];
+        app.chat_input = "/debt".into();
+        app.submit(&chat_tx, &seg_tx);
+        let last = app.chat_log.last().unwrap();
+        assert!(last.text.contains("comprehension") && last.text.contains("unread lines"));
+    }
+
+    #[test]
+    fn pinned_question_marks_its_segment_understood() {
+        let mut app = cockpit_app();
+        app.provider = None; // avoid spawning a real chat task in a sync test
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.activity_sel = Some(2); // pinned inside segment 0
+        app.chat_input = "what is this doing?".into();
+        app.submit(&chat_tx, &seg_tx);
+        let r = coverage(&app.segments, &app.interactions);
+        assert_eq!(r.per_segment[0], SegmentState::Understood);
     }
 
     #[test]

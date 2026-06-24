@@ -2,6 +2,7 @@
 //! model providers, and summaries. No TUI. Mirrors the Python `understudy` package.
 
 pub mod chat;
+pub mod comprehension;
 pub mod config;
 pub mod context;
 pub mod events;
