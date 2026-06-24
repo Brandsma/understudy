@@ -5,9 +5,10 @@ has actually *engaged with and understood*. This is the natural "so what" number
 Understudy: the app exists to fight comprehension debt, so it should be able to show you
 how much you're carrying.
 
-> **Status:** design locked, unimplemented. This doc records the decisions and their
-> rationale so the build can start from a settled target. Prompt/weight tuning is expected
-> once it runs against real sessions.
+> **Status:** implemented (K1–K5). Tier-1 (deterministic gauge, `/debt`), Tier-2 (LLM
+> tagging via `/tagging`, explain-back via `/explain`), and per-session persistence with
+> the `understudy debt` trend view all ship. Prompt/weight tuning of the LLM tiers is
+> expected once it runs against a capable local model.
 
 ## Why this fits Understudy
 

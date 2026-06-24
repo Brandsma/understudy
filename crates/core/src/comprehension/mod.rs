@@ -14,6 +14,8 @@ use crate::models::ChatMessage;
 use crate::segments::Segment;
 use crate::store::EventStore;
 
+pub mod ledger;
+
 /// How well a single segment is understood. Ordered Unseen < Skimmed < Understood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentState {

@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use understudy_core::chat::system_with_activity;
 use understudy_core::comprehension::{
-    coverage, explain_request, grade_request, parse_tags, parse_verdict, tag_request, Band,
+    coverage, explain_request, grade_request, ledger, parse_tags, parse_verdict, tag_request, Band,
     CoverageReport, Interactions, SegmentState, Verdict,
 };
 use understudy_core::config::load_config;
@@ -132,6 +132,7 @@ pub struct App {
     store: EventStore,
     title: String,
     branch: String,
+    session_id: String,
     scroll: u16, // activity lines scrolled up from the bottom (0 = following)
     activity_sel: Option<usize>, // selected event index while Activity is focused
     active: Option<Panel>,
@@ -168,6 +169,7 @@ impl App {
             store: EventStore::new(),
             title: String::new(),
             branch: String::new(),
+            session_id: String::new(),
             scroll: 0,
             activity_sel: None,
             active: None,
@@ -198,6 +200,7 @@ impl App {
         let path = info.path.clone();
         self.title = short_project(&info.cwd);
         self.branch = info.git_branch.clone();
+        self.session_id = info.session_id.clone();
         self.store = EventStore::new();
         self.scroll = 0;
         self.activity_sel = None;
@@ -231,11 +234,28 @@ impl App {
     }
 
     fn back_to_picker(&mut self) {
+        self.persist();
         if let Some(handle) = self.tailer.take() {
             handle.abort();
         }
         self.active = None;
         self.mode = Mode::Picker;
+    }
+
+    /// Append this session's comprehension snapshot to the ledger (best-effort). Only when
+    /// there's something to record (cockpit with computed segments).
+    fn persist(&self) {
+        if !matches!(self.mode, Mode::Cockpit) || self.segments.is_empty() {
+            return;
+        }
+        let rec = ledger::record_from(
+            self.session_id.clone(),
+            self.title.clone(),
+            self.branch.clone(),
+            &self.segments,
+            &self.interactions,
+        );
+        let _ = ledger::append(&rec);
     }
 
     /// Cycle the active (Tab-focusable) panel forward (`dir > 0`) or backward.
@@ -763,6 +783,7 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
     // Global quit (works even while typing in the chat input).
     if matches!(code, KeyCode::Char('c') | KeyCode::Char('q')) && mods.contains(KeyModifiers::CONTROL) {
+        app.persist();
         app.should_quit = true;
         return;
     }
@@ -1650,6 +1671,24 @@ mod tests {
         app.segments = vec![fake_segment("a", 0, 3), fake_segment("b", 3, 6)];
         app.interactions.set_override(0, SegmentState::Understood);
         assert_eq!(app.least_understood_segment(), Some(1));
+    }
+
+    #[test]
+    fn persist_writes_a_ledger_record() {
+        let tmp = std::env::temp_dir().join(format!("understudy_tui_ledger_{}.jsonl", std::process::id()));
+        std::env::set_var("UNDERSTUDY_LEDGER", &tmp);
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut app = cockpit_app();
+        app.session_id = "sX".into();
+        app.segments = vec![fake_segment("a", 0, 5)];
+        app.persist();
+
+        let recs = understudy_core::comprehension::ledger::read_all();
+        assert!(recs.iter().any(|r| r.session_id == "sX" && r.project == "proj"));
+
+        let _ = std::fs::remove_file(&tmp);
+        std::env::remove_var("UNDERSTUDY_LEDGER");
     }
 
     #[test]

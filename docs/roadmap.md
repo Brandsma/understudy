@@ -94,13 +94,14 @@ for a single static binary and a lean always-on footprint. Planned in two couple
 The Python phases above (0–2 done) stay the working tool until the Rust build reaches
 parity at R5.
 
-## Comprehension Debt KPI (designed, unimplemented)
+## Comprehension Debt KPI ✅
 
 A best-effort, in-app metric estimating how much of what the agent produced a human has
 actually engaged with and understood — segment-level Comprehension Coverage, surfaced as
-timeline glyphs + a status-bar gauge, with LLM-tagged inquiry attribution and an opt-in
-explain-back check, persisted per session to trend debt over time. Design and research
-grounding are locked in [comprehension-debt-kpi.md](comprehension-debt-kpi.md).
+timeline glyphs + a status-bar gauge (`/debt`), with LLM-tagged inquiry attribution
+(`/tagging`) and an opt-in explain-back check (`/explain`), persisted per session and
+trended via `understudy debt`. Design and research grounding are in
+[comprehension-debt-kpi.md](comprehension-debt-kpi.md).
 
 ## The concrete first week
 

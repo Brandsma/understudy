@@ -54,6 +54,8 @@ enum Cmd {
         #[arg(long)]
         here: bool,
     },
+    /// Show the comprehension-coverage trend per project from the local ledger.
+    Debt,
     /// Check the configured model provider.
     Check,
 }
@@ -65,6 +67,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Tail { session, here }) => tail(session, here).await,
         Some(Cmd::Ask { question, session, here }) => ask(question, session, here).await,
         Some(Cmd::Segments { session, here }) => segments(session, here).await,
+        Some(Cmd::Debt) => debt(),
         Some(Cmd::Check) => check().await,
         None => tui::run().await,
     }
@@ -176,6 +179,20 @@ async fn segments(session: Option<String>, here: bool) -> Result<()> {
             let tools = s.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect::<Vec<_>>().join(" ");
             println!("   tools: {tools}");
         }
+    }
+    Ok(())
+}
+
+fn debt() -> Result<()> {
+    let trends = understudy_core::comprehension::ledger::trends();
+    if trends.is_empty() {
+        println!("no comprehension records yet — they're written when you leave a session in the cockpit");
+        return Ok(());
+    }
+    println!("{:<26} {:>8} {:>8} {:>8}", "PROJECT", "SESSIONS", "LATEST", "AVG");
+    for t in trends {
+        let pct = |c: f32| (c * 100.0).round() as u8;
+        println!("{:<26.26} {:>8} {:>7}% {:>7}%", t.project, t.sessions, pct(t.latest_coverage), pct(t.avg_coverage));
     }
     Ok(())
 }
