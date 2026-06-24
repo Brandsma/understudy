@@ -1664,6 +1664,7 @@ dependencies = [
  "crossterm",
  "futures",
  "ratatui",
+ "serde_json",
  "tokio",
  "understudy-core",
 ]

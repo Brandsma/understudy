@@ -47,6 +47,13 @@ enum Cmd {
         #[arg(long)]
         here: bool,
     },
+    /// Split a session into model-determined semantic segments.
+    Segments {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        here: bool,
+    },
     /// Check the configured model provider.
     Check,
 }
@@ -57,6 +64,7 @@ async fn main() -> Result<()> {
         Some(Cmd::Sessions) => sessions(),
         Some(Cmd::Tail { session, here }) => tail(session, here).await,
         Some(Cmd::Ask { question, session, here }) => ask(question, session, here).await,
+        Some(Cmd::Segments { session, here }) => segments(session, here).await,
         Some(Cmd::Check) => check().await,
         None => tui::run().await,
     }
@@ -133,6 +141,42 @@ async fn ask(question: String, session: Option<String>, here: bool) -> Result<()
         print!("{tail}");
     }
     println!();
+    Ok(())
+}
+
+async fn segments(session: Option<String>, here: bool) -> Result<()> {
+    let path = pick_session(session, here)?;
+    let mut src = ClaudeCodeSource::new(&path);
+    let mut store = EventStore::new();
+    store.bulk_add(src.backfill());
+
+    let cfg = load_config();
+    let provider = build_provider(&cfg.provider)
+        .ok_or_else(|| anyhow!("no model configured (provider kind is 'none')"))?;
+
+    let segs = understudy_core::segments::segment_session(&provider, &store)
+        .await
+        .map_err(|e| anyhow!(e.to_string()))?;
+    if segs.is_empty() {
+        println!("no activity to segment");
+        return Ok(());
+    }
+    for (i, s) in segs.iter().enumerate() {
+        let span = match (s.first_ts, s.last_ts) {
+            (Some(a), Some(b)) => format!("{}–{}", a.format("%H:%M"), b.format("%H:%M")),
+            _ => String::new(),
+        };
+        let errors = if s.errors > 0 { format!(" · {} error(s)", s.errors) } else { String::new() };
+        println!("{}. {}  [{span}]", i + 1, s.title);
+        println!(
+            "   events {}..{} · {} file(s) · +{} -{}{errors}",
+            s.start_idx, s.end_idx, s.files.len(), s.lines_added, s.lines_removed
+        );
+        if !s.tool_counts.is_empty() {
+            let tools = s.tool_counts.iter().map(|(n, c)| format!("{n}×{c}")).collect::<Vec<_>>().join(" ");
+            println!("   tools: {tools}");
+        }
+    }
     Ok(())
 }
 

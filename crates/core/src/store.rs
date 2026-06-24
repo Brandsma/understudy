@@ -13,6 +13,8 @@ pub struct EventStore {
     pub last_action: String,
     pub current_turn: Option<String>,
     pub error_count: usize,
+    pub lines_added: usize,
+    pub lines_removed: usize,
 }
 
 impl Default for EventStore {
@@ -26,6 +28,8 @@ impl Default for EventStore {
             last_action: "waiting…".to_string(),
             current_turn: None,
             error_count: 0,
+            lines_added: 0,
+            lines_removed: 0,
         }
     }
 }
@@ -53,8 +57,10 @@ impl EventStore {
                     self.error_count += 1;
                 }
             }
-            EventKind::FileEdit { path, .. } => {
+            EventKind::FileEdit { path, added, removed, .. } => {
                 *self.files_touched.entry(path.clone()).or_default() += 1;
+                self.lines_added += added;
+                self.lines_removed += removed;
                 self.last_action = format!("editing {}", basename(path));
             }
             EventKind::Thinking { .. } => self.last_action = "thinking".to_string(),

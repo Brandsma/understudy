@@ -37,14 +37,19 @@ const LIVE_SYS: &str = "You summarize another coding agent's recent activity for
 const LIVE_PROMPT: &str = "In ONE or TWO short sentences, say what the agent is doing right now and why. \
 Be specific (name files and tools). No preamble, no bullet points, no markdown.";
 
-/// Tier-2: debounced "what & why" over the rolling window.
-pub async fn live_summary(provider: &Provider, store: &EventStore) -> Result<String, ProviderError> {
+/// Build the Tier-2 "what & why" prompt messages over the rolling window. Exposed so a
+/// caller (e.g. the TUI) can run the request as a detached `'static` stream itself.
+pub fn live_summary_messages(store: &EventStore) -> Vec<ChatMessage> {
     let activity = render_activity(store, 80, 6000);
-    let messages = vec![
+    vec![
         ChatMessage::system(LIVE_SYS),
         ChatMessage::user(format!("{LIVE_PROMPT}\n\n=== ACTIVITY ===\n{activity}")),
-    ];
-    Ok(strip_think(&complete(provider, messages).await?))
+    ]
+}
+
+/// Tier-2: debounced "what & why" over the rolling window.
+pub async fn live_summary(provider: &Provider, store: &EventStore) -> Result<String, ProviderError> {
+    Ok(strip_think(&complete(provider, live_summary_messages(store)).await?))
 }
 
 const THINK_SYS: &str = "You distill another coding agent's chain-of-thought into a short 'thought pattern' for an observer.";

@@ -7,6 +7,7 @@ pub mod context;
 pub mod events;
 pub mod filters;
 pub mod models;
+pub mod segments;
 pub mod sources;
 pub mod store;
 pub mod summary;
