@@ -250,4 +250,48 @@ mod tests {
         let store = EventStore::new();
         assert!(build_segments(vec![(0, "x".into())], &[], &store).is_empty());
     }
+
+    #[test]
+    fn parse_boundaries_returns_empty_on_garbage() {
+        assert!(parse_boundaries("I could not produce JSON, sorry.").is_empty());
+        assert!(parse_boundaries("").is_empty());
+        assert!(parse_boundaries("[not valid json]").is_empty());
+    }
+
+    #[test]
+    fn tidy_title_trims_quotes_clips_and_defaults() {
+        assert_eq!(tidy_title("  \"Refactor store\"  "), "Refactor store");
+        assert_eq!(tidy_title(""), "Untitled");
+        assert_eq!(tidy_title("\"\""), "Untitled");
+        assert!(tidy_title(&"x".repeat(100)).chars().count() <= 48);
+    }
+
+    #[test]
+    fn segment_request_builds_prompt_and_index_map() {
+        let store = fixture_store();
+        let (messages, map) = segment_request(&store);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[1].content.contains("=== ACTIVITY ==="));
+        // Map has one entry per listed (non-empty) event, each a valid event index.
+        assert!(!map.is_empty());
+        assert!(map.iter().all(|&i| i < store.events.len()));
+    }
+
+    #[test]
+    fn split_preserves_total_tool_counts() {
+        let store = fixture_store();
+        let (_, map) = segment_input(&store, 1000);
+        let segs = build_segments(vec![(0, "A".into()), (1, "B".into())], &map, &store);
+        // Tool counts summed across segments equal the store's overall histogram.
+        let mut combined: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for s in &segs {
+            for (k, v) in &s.tool_counts {
+                *combined.entry(k.clone()).or_default() += v;
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> =
+            store.tool_counts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert_eq!(combined, expected);
+    }
 }

@@ -9,6 +9,7 @@ use understudy_core::filters::{strip_think, ThinkFilter};
 use understudy_core::models::build_provider;
 use understudy_core::sources::claude_code::{read_session_meta, ClaudeCodeSource};
 use understudy_core::store::EventStore;
+use understudy_core::summary::live_summary_messages;
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
@@ -169,6 +170,30 @@ fn render_activity_includes_markers() {
     assert!(text.contains("TOOL→ Bash"));
     assert!(text.contains("TOOL← Bash ok"));
     assert!(text.contains("EDIT config.json +1-1")); // Old -> New: one +, one -
+}
+
+#[test]
+fn store_accumulates_edited_lines() {
+    let mut store = EventStore::new();
+    store.bulk_add(backfill("sample_session.jsonl"));
+    assert_eq!(store.lines_added, 1); // config.json +1
+    assert_eq!(store.lines_removed, 1); // config.json -1
+
+    let mut created = EventStore::new();
+    created.bulk_add(backfill("write_create.jsonl"));
+    assert_eq!(created.lines_added, 3); // new file: 3 lines
+    assert_eq!(created.lines_removed, 0);
+}
+
+#[test]
+fn live_summary_messages_carry_activity() {
+    let mut store = EventStore::new();
+    store.bulk_add(backfill("sample_session.jsonl"));
+    let msgs = live_summary_messages(&store);
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].role, "system");
+    assert_eq!(msgs[1].role, "user");
+    assert!(msgs[1].content.contains("TOOL→ Bash")); // rendered activity is included
 }
 
 // ---- config + provider factory -------------------------------------------- //

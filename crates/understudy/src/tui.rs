@@ -1132,6 +1132,10 @@ mod tests {
         store
     }
 
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         let mut out = String::new();
         for y in 0..buf.area.height {
@@ -1331,6 +1335,51 @@ mod tests {
         assert!(!app.segments_loading);
         assert_eq!(app.segments.len(), 1);
         assert_eq!(app.segments[0].title, "All");
+    }
+
+    #[test]
+    fn selecting_a_file_edit_shows_its_diff_in_detail() {
+        let store = fixture_store();
+        let edit = store
+            .events
+            .iter()
+            .find(|e| matches!(e.kind, EventKind::FileEdit { .. }))
+            .expect("fixture has a file edit");
+        let lines = detail_lines(edit, 60, 20);
+        assert_eq!(line_text(&lines[0]), "config.json"); // header = basename
+        assert!(
+            lines.iter().any(|l| line_text(l).starts_with('-') || line_text(l).starts_with('+')),
+            "expected a +/- diff line in Detail"
+        );
+    }
+
+    #[test]
+    fn nav_event_clamps_at_the_first_event() {
+        let mut app = cockpit_app();
+        app.cycle_panel(1); // Activity
+        app.nav_active(-100_000); // far past the start
+        assert_eq!(app.activity_sel, Some(0));
+    }
+
+    #[test]
+    fn three_stage_esc_unfocus_unpin_then_picker() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = cockpit_app();
+        let (ev_tx, _r0) = mpsc::unbounded_channel::<Vec<Event>>();
+        let (chat_tx, _r1) = mpsc::unbounded_channel::<ChatMsg>();
+        let (seg_tx, _r2) = mpsc::unbounded_channel::<SegMsg>();
+        app.active = Some(Panel::Activity);
+        app.activity_sel = Some(2);
+
+        let esc = |a: &mut App| handle_key(a, KeyCode::Esc, KeyModifiers::NONE, &ev_tx, &chat_tx, &seg_tx);
+
+        esc(&mut app); // 1: unfocus panel
+        assert!(app.active.is_none() && app.activity_sel.is_some());
+        esc(&mut app); // 2: unpin (resume live)
+        assert!(app.activity_sel.is_none());
+        assert!(matches!(app.mode, Mode::Cockpit));
+        esc(&mut app); // 3: back to picker
+        assert!(matches!(app.mode, Mode::Picker));
     }
 
     #[test]
