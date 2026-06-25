@@ -9,6 +9,7 @@ use crate::events::Event;
 
 pub mod antigravity;
 pub mod claude_code;
+pub mod copilot;
 pub mod opencode;
 
 /// Which coding agent a session belongs to. Drives the picker label and which adapter
@@ -79,6 +80,7 @@ pub trait Source: Send {
 pub fn discover_all(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
     let mut out = claude_code::discover_sessions(cwd_filter);
     out.extend(opencode::discover_sessions(cwd_filter));
+    out.extend(copilot::discover_sessions(cwd_filter));
     out.extend(antigravity::discover_sessions(cwd_filter));
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out
@@ -88,6 +90,7 @@ pub fn discover_all(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
 pub fn open_source(info: &SessionInfo) -> Box<dyn Source + Send> {
     match info.agent {
         Agent::OpenCode => Box::new(opencode::OpenCodeSource::new(&info.path, &info.session_id)),
+        Agent::Copilot => Box::new(copilot::CopilotSource::new(&info.path, &info.session_id)),
         Agent::Antigravity => {
             Box::new(antigravity::AntigravitySource::new(&info.path, &info.session_id))
         }
