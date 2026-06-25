@@ -15,6 +15,7 @@ use crate::segments::Segment;
 use crate::store::EventStore;
 
 pub mod ledger;
+pub mod session_cache;
 
 /// How well a single segment is understood. Ordered Unseen < Skimmed < Understood.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

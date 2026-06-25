@@ -31,14 +31,22 @@ pub struct Segment {
     pub last_ts: Option<DateTime<FixedOffset>>,
 }
 
-const SEG_SYS: &str = "You analyze a coding agent's activity log and split it into a small number of \
-contiguous segments, where each segment is one coherent piece of work. A new segment begins when the \
-agent clearly shifts to a different task, file area, or goal.";
+const SEG_SYS: &str = "You are an expert at reading a coding agent's activity log and breaking it into the \
+distinct pieces of work it represents. Each segment is one coherent task or goal. A new segment begins \
+whenever the agent shifts focus — to a different feature or bug, a different area of the codebase, or a \
+different phase of work (e.g. exploring → implementing, implementing → fixing tests, one feature → the next).";
 
-const SEG_PROMPT: &str = "Below is a numbered activity log (one line per event). Divide it into segments. \
-Return ONLY a JSON array, no prose, where each element is {\"start\": <line number where the segment begins>, \
-\"title\": \"<3-6 word description>\"}. The first segment must start at 0. Use as few segments as capture the \
-real shifts in work (typically 2-8). Titles name concrete work, e.g. \"Refactor event store\", \"Fix failing tests\".";
+const SEG_PROMPT: &str = "Below is a numbered activity log, one line per event. Split it into contiguous \
+segments that each capture one coherent piece of work.\n\
+Rules:\n\
+- Return ONLY a JSON array, no prose and no markdown fences. Each element is {\"start\": <0-based line \
+number where the segment begins>, \"title\": \"<3-6 word description of that work>\"}.\n\
+- Segments must be in order, non-overlapping, and the first must start at line 0.\n\
+- Return at least 2 segments (typically 3-8). Never return a single segment that covers the whole log.\n\
+- Title each segment with the concrete work it contains, e.g. \"Refactor event store\", \"Fix failing port \
+tests\", \"Add segmentation cache\". Never use vague catch-all titles like \"Session\", \"Whole session\", \
+\"Coding\", or \"Misc\".\n\
+- Place boundaries at real shifts in work, not at arbitrary intervals.";
 
 /// Segment the session by asking the configured model for boundaries, then computing
 /// stats deterministically. On any model/parse failure the session degrades to a
@@ -56,7 +64,14 @@ pub async fn segment_session(provider: &Provider, store: &EventStore) -> Result<
 /// caller (e.g. the TUI) can run the request as a detached `'static` stream and then call
 /// [`build_segments`] with the (still valid, append-only) `map` once the reply arrives.
 pub fn segment_request(store: &EventStore) -> (Vec<ChatMessage>, Vec<usize>) {
-    let (listing, map) = segment_input(store, MAX_EVENTS);
+    segment_request_from(store, 0)
+}
+
+/// Like [`segment_request`] but only lists events from `start_idx` onward (still capped to
+/// the most recent [`MAX_EVENTS`]). Used for incremental segmentation: everything before
+/// `start_idx` is already segmented and frozen, so it isn't re-sent to the model.
+pub fn segment_request_from(store: &EventStore, start_idx: usize) -> (Vec<ChatMessage>, Vec<usize>) {
+    let (listing, map) = segment_input(store, start_idx, MAX_EVENTS);
     if map.is_empty() {
         return (Vec::new(), map);
     }
@@ -67,11 +82,12 @@ pub fn segment_request(store: &EventStore) -> (Vec<ChatMessage>, Vec<usize>) {
     (messages, map)
 }
 
-/// Render the recent events as a numbered listing for the prompt, plus the parallel map
-/// from listing line number (0-based) → index into `store.events`, so a model-returned
-/// boundary maps back to a real event.
-fn segment_input(store: &EventStore, max_events: usize) -> (String, Vec<usize>) {
-    let start = store.events.len().saturating_sub(max_events);
+/// Render events `[start_idx, len)` (clamped to the most recent `max_events`) as a numbered
+/// listing for the prompt, plus the parallel map from listing line number (0-based) → index
+/// into `store.events`, so a model-returned boundary maps back to a real event.
+fn segment_input(store: &EventStore, start_idx: usize, max_events: usize) -> (String, Vec<usize>) {
+    let cap_start = store.events.len().saturating_sub(max_events);
+    let start = start_idx.max(cap_start);
     let mut lines = Vec::new();
     let mut map = Vec::new();
     for (i, ev) in store.events.iter().enumerate().skip(start) {
@@ -99,6 +115,27 @@ pub fn parse_boundaries(raw: &str) -> Vec<(usize, String)> {
     parsed.into_iter().map(|b| (b.start, tidy_title(&b.title))).collect()
 }
 
+/// Extract every *complete* `{"start":..,"title":..}` object from a reply that may still be
+/// streaming (no closing `]` yet). Used to surface segmentation progress live as the model
+/// emits each boundary, before the full array is available to [`parse_boundaries`].
+pub fn parse_partial_boundaries(raw: &str) -> Vec<(usize, String)> {
+    let cleaned = strip_think(raw);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(open) = cleaned[i..].find('{') {
+        let start = i + open;
+        let Some(close_rel) = cleaned[start..].find('}') else {
+            break; // object still arriving — stop here
+        };
+        let end = start + close_rel;
+        if let Ok(b) = serde_json::from_str::<RawBoundary>(&cleaned[start..=end]) {
+            out.push((b.start, tidy_title(&b.title)));
+        }
+        i = end + 1;
+    }
+    out
+}
+
 #[derive(serde::Deserialize)]
 struct RawBoundary {
     start: usize,
@@ -111,16 +148,35 @@ pub fn build_segments(pairs: Vec<(usize, String)>, map: &[usize], store: &EventS
     if map.is_empty() || store.events.is_empty() {
         return Vec::new();
     }
-    let pairs = normalize(pairs, map.len());
-    let mut segments = Vec::with_capacity(pairs.len());
-    for (k, (line, title)) in pairs.iter().enumerate() {
-        let start_idx = map[*line];
-        let end_idx = if k + 1 < pairs.len() {
-            map[pairs[k + 1].0]
-        } else {
-            store.events.len()
-        };
-        segments.push(stats_for(store, start_idx, end_idx, title.clone()));
+    build_segments_from_starts(boundaries_to_starts(pairs, map), store)
+}
+
+/// Map (listing_line, title) boundaries through `map` to absolute event-index starts,
+/// guaranteeing the window's first listed event is itself a boundary (so the segments
+/// cover the whole listed range contiguously).
+pub fn boundaries_to_starts(pairs: Vec<(usize, String)>, map: &[usize]) -> Vec<(usize, String)> {
+    normalize(pairs, map.len()).into_iter().map(|(line, title)| (map[line], title)).collect()
+}
+
+/// Build contiguous segments from absolute event-index starts (each segment runs to the
+/// next start, the last to the end of the store). Starts are sorted/deduped/range-checked;
+/// coverage begins at the smallest start. Used for both fresh and incremental segmentation,
+/// and to rebuild segments from a persisted cache.
+pub fn build_segments_from_starts(mut starts: Vec<(usize, String)>, store: &EventStore) -> Vec<Segment> {
+    let n = store.events.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    starts.retain(|(s, _)| *s < n);
+    starts.sort_by_key(|(s, _)| *s);
+    starts.dedup_by_key(|(s, _)| *s);
+    if starts.is_empty() {
+        return Vec::new();
+    }
+    let mut segments = Vec::with_capacity(starts.len());
+    for (k, (start, title)) in starts.iter().enumerate() {
+        let end = if k + 1 < starts.len() { starts[k + 1].0 } else { n };
+        segments.push(stats_for(store, *start, end, title.clone()));
     }
     segments
 }
@@ -130,8 +186,10 @@ fn normalize(mut pairs: Vec<(usize, String)>, map_len: usize) -> Vec<(usize, Str
     pairs.retain(|(s, _)| *s < map_len);
     pairs.sort_by_key(|(s, _)| *s);
     pairs.dedup_by_key(|(s, _)| *s);
+    // Fallback only when the model returned nothing usable; label it honestly rather than as
+    // a real "Session" block (the prompt asks for >= 2 concrete segments).
     if pairs.is_empty() {
-        pairs.push((0, "Session".to_string()));
+        pairs.push((0, "Unsegmented activity".to_string()));
     } else if pairs[0].0 != 0 {
         pairs.insert(0, (0, "Session start".to_string()));
     }
@@ -206,7 +264,7 @@ mod tests {
     #[test]
     fn single_segment_covers_all_and_matches_store_totals() {
         let store = fixture_store();
-        let (_, map) = segment_input(&store, 1000);
+        let (_, map) = segment_input(&store, 0, 1000);
         let segs = build_segments(vec![(0, "All".into())], &map, &store);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].start_idx, 0);
@@ -219,9 +277,27 @@ mod tests {
     }
 
     #[test]
+    fn build_from_starts_merges_frozen_and_new_contiguously() {
+        // Mimics an incremental pass: frozen block at 0, two new blocks from the model.
+        let store = fixture_store();
+        let n = store.events.len();
+        assert!(n >= 6, "fixture needs enough events");
+        let segs = build_segments_from_starts(
+            vec![(0, "frozen".into()), (5, "new B".into()), (2, "new A".into())], // unsorted on purpose
+            &store,
+        );
+        assert_eq!(segs.len(), 3);
+        // Sorted, contiguous, and covering the whole store.
+        assert_eq!((segs[0].start_idx, segs[0].end_idx), (0, 2));
+        assert_eq!((segs[1].start_idx, segs[1].end_idx), (2, 5));
+        assert_eq!((segs[2].start_idx, segs[2].end_idx), (5, n));
+        assert_eq!(segs[0].title, "frozen");
+    }
+
+    #[test]
     fn boundary_splits_into_contiguous_segments() {
         let store = fixture_store();
-        let (_, map) = segment_input(&store, 1000);
+        let (_, map) = segment_input(&store, 0, 1000);
         assert!(map.len() >= 2, "fixture needs at least two listed events");
         let segs = build_segments(vec![(0, "A".into()), (1, "B".into())], &map, &store);
         assert_eq!(segs.len(), 2);
@@ -249,6 +325,14 @@ mod tests {
     fn empty_store_yields_no_segments() {
         let store = EventStore::new();
         assert!(build_segments(vec![(0, "x".into())], &[], &store).is_empty());
+    }
+
+    #[test]
+    fn parse_partial_boundaries_reads_objects_before_array_closes() {
+        // Mid-stream: array opened, two objects complete, a third still arriving.
+        let raw = "[{\"start\":0,\"title\":\"Setup deps\"},{\"start\":5,\"title\":\"Refactor\"},{\"start\":9,\"tit";
+        let bs = parse_partial_boundaries(raw);
+        assert_eq!(bs, vec![(0, "Setup deps".to_string()), (5, "Refactor".to_string())]);
     }
 
     #[test]
@@ -281,7 +365,7 @@ mod tests {
     #[test]
     fn split_preserves_total_tool_counts() {
         let store = fixture_store();
-        let (_, map) = segment_input(&store, 1000);
+        let (_, map) = segment_input(&store, 0, 1000);
         let segs = build_segments(vec![(0, "A".into()), (1, "B".into())], &map, &store);
         // Tool counts summed across segments equal the store's overall histogram.
         let mut combined: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();

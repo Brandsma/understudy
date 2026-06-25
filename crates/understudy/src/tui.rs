@@ -15,15 +15,18 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use understudy_core::chat::system_with_activity;
 use understudy_core::comprehension::{
-    coverage, explain_request, grade_request, ledger, parse_tags, parse_verdict, tag_request, Band,
-    CoverageReport, Interactions, SegmentState, Verdict,
+    coverage, explain_request, grade_request, ledger, parse_tags, parse_verdict, session_cache,
+    tag_request, Band, CoverageReport, Interactions, SegmentState, Verdict,
 };
 use understudy_core::config::load_config;
 use understudy_core::context::{clip, event_line};
 use understudy_core::events::{Event, EventKind, Hunk};
 use understudy_core::filters::{strip_think, ThinkFilter};
 use understudy_core::models::{build_provider, ChatMessage, Provider};
-use understudy_core::segments::{build_segments, parse_boundaries, segment_request, Segment};
+use understudy_core::segments::{
+    boundaries_to_starts, build_segments_from_starts, parse_boundaries, parse_partial_boundaries,
+    segment_request_from, Segment,
+};
 use understudy_core::sources::claude_code::{discover_sessions, ClaudeCodeSource, SessionInfo};
 use understudy_core::store::EventStore;
 use understudy_core::summary::live_summary_messages;
@@ -36,7 +39,7 @@ const WIDE_ROWS: u16 = 12;
 /// Quiet period after the last event before the Tier-2 summary is (re)computed.
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Chat `/help` text.
-const HELP: &str = "commands: /segments  /debt  /explain [n]  /tagging  /follow  /session  /model [name]  \
+const HELP: &str = "commands: /segments [--force]  /debt  /explain [n]  /tagging  /follow  /session  /model [name]  \
 /clear  /help  ·  tab: focus a panel  ·  ↑↓: select  ·  esc: unpin → back";
 
 enum Mode {
@@ -93,8 +96,10 @@ enum SummaryMsg {
 }
 
 /// Result of an on-demand `/segments` run: the raw model reply (parsed on the UI thread,
-/// where the store lives) or an error message.
+/// where the store lives) or an error message. `Progress` carries the segment titles found
+/// so far while the boundary array is still streaming, for live feedback.
 enum SegMsg {
+    Progress(Vec<String>),
     Done(String),
     Error(String),
 }
@@ -141,6 +146,13 @@ pub struct App {
     segments_sel: Option<usize>,
     segments_loading: bool,
     seg_map: Vec<usize>, // listing-line → event-index map for the in-flight request
+    seg_total: usize,    // events handed to the in-flight segmentation (for progress)
+    seg_progress: Vec<String>, // segment titles discovered so far while streaming
+    seg_frozen: Vec<(usize, String)>, // already-segmented blocks before the in-flight window
+    seg_watermark: usize, // events covered by the current segments (persisted; incremental base)
+    auto_segment_pending: bool, // reconcile cache / segment history once backfill first arrives
+    pending_cache: Option<session_cache::SessionCache>, // loaded cache, applied after backfill
+    summary_len: usize,  // event count the current glance_summary covers (for persistence)
     interactions: Interactions, // comprehension signals (seen / inquiry / overrides)
     tagging_enabled: bool,      // Tier-2: LLM-tag each question (opt-in, costs a call)
     awaiting_explain: Option<Explain>, // explain-back: next chat turn is the answer
@@ -151,6 +163,9 @@ pub struct App {
     chat_input: String,
     chat_log: Vec<ChatEntry>,
     chat_streaming: bool,
+    history: Vec<String>,       // submitted inputs, oldest first (shell-style command history)
+    history_pos: Option<usize>, // browse cursor into `history`; None = editing the live draft
+    draft: String,              // in-progress input stashed while browsing history
     should_quit: bool,
     tailer: Option<tokio::task::JoinHandle<()>>,
 }
@@ -178,6 +193,13 @@ impl App {
             segments_sel: None,
             segments_loading: false,
             seg_map: Vec::new(),
+            seg_total: 0,
+            seg_progress: Vec::new(),
+            seg_frozen: Vec::new(),
+            seg_watermark: 0,
+            auto_segment_pending: false,
+            pending_cache: None,
+            summary_len: 0,
             interactions: Interactions::new(),
             tagging_enabled: false,
             awaiting_explain: None,
@@ -188,6 +210,9 @@ impl App {
             chat_input: String::new(),
             chat_log: Vec::new(),
             chat_streaming: false,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
             should_quit: false,
             tailer: None,
         }
@@ -209,12 +234,28 @@ impl App {
         self.segments_sel = None;
         self.segments_loading = false;
         self.seg_map.clear();
+        self.seg_total = 0;
+        self.seg_progress.clear();
+        self.seg_frozen.clear();
+        self.seg_watermark = 0;
+        self.auto_segment_pending = true; // reconcile cache / segment history once backfill lands
         self.interactions = Interactions::new();
         self.awaiting_explain = None;
         self.glance_summary.clear();
         self.summary_loading = false;
         self.summary_dirty = false;
+        self.summary_len = 0;
+        // Restore the persisted summary now; cached segments need the store, so they're
+        // rebuilt once backfill arrives (see `reconcile_on_backfill`).
+        self.pending_cache = session_cache::load(&self.session_id);
+        if let Some(c) = &self.pending_cache {
+            self.glance_summary = c.summary.clone();
+            self.summary_len = c.summary_len;
+        }
         self.chat_log.clear();
+        self.history.clear();
+        self.history_pos = None;
+        self.draft.clear();
         self.mode = Mode::Cockpit;
         if let Some(handle) = self.tailer.take() {
             handle.abort();
@@ -258,6 +299,48 @@ impl App {
         let _ = ledger::append(&rec);
     }
 
+    /// Record a submitted input into the command history (skipping consecutive duplicates)
+    /// and reset history browsing.
+    fn record_history(&mut self, input: &str) {
+        if self.history.last().map(String::as_str) != Some(input) {
+            self.history.push(input.to_string());
+        }
+        self.history_pos = None;
+        self.draft.clear();
+    }
+
+    /// Step to an older command (Up). The live draft is stashed on the first step so it can be
+    /// restored by stepping back down past the newest entry.
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let i = match self.history_pos {
+            None => {
+                self.draft = std::mem::take(&mut self.chat_input);
+                self.history.len() - 1
+            }
+            Some(0) => return, // already at the oldest
+            Some(i) => i - 1,
+        };
+        self.history_pos = Some(i);
+        self.chat_input = self.history[i].clone();
+    }
+
+    /// Step to a newer command (Down); past the newest, restore the stashed draft.
+    fn history_next(&mut self) {
+        let Some(i) = self.history_pos else {
+            return; // not browsing
+        };
+        if i + 1 < self.history.len() {
+            self.history_pos = Some(i + 1);
+            self.chat_input = self.history[i + 1].clone();
+        } else {
+            self.history_pos = None;
+            self.chat_input = std::mem::take(&mut self.draft);
+        }
+    }
+
     /// Cycle the active (Tab-focusable) panel forward (`dir > 0`) or backward.
     fn cycle_panel(&mut self, dir: i32) {
         let order = [Panel::Activity, Panel::Segments, Panel::Thinking];
@@ -282,6 +365,11 @@ impl App {
             }
         };
         self.active = next.map(|i| order[i]);
+        // Focusing Activity auto-selects: the prior pin survives tabbing away, so it just
+        // re-appears; on the first focus (nothing pinned) land on the most recent line.
+        if self.active == Some(Panel::Activity) && self.activity_sel.is_none() {
+            self.nav_event(0); // delta 0 → defaults to the latest event and marks it seen
+        }
     }
 
     /// Route `↑↓`/`PgUp`/`PgDn` to whichever panel is focused.
@@ -323,9 +411,18 @@ impl App {
         self.interactions.mark_seen(start); // jumping to a segment counts as skimming it
     }
 
-    /// Build the `/segments` request and run the LLM call as a detached stream. Segments
-    /// are assembled on the UI thread once the reply arrives (see [`Self::on_seg_msg`]).
-    fn start_segmentation(&mut self, tx: &UnboundedSender<SegMsg>) {
+    /// Segment incrementally from the start of the last block (extends it / adds new blocks),
+    /// or do a full re-segmentation when `force`.
+    fn start_segmentation(&mut self, force: bool, tx: &UnboundedSender<SegMsg>) {
+        let window_start = if force { 0 } else { self.segments.last().map_or(0, |s| s.start_idx) };
+        self.start_seg_from(window_start, tx);
+    }
+
+    /// Run segmentation over `events[window_start..]` as a detached stream. Blocks entirely
+    /// before the window are frozen (kept as-is, never re-sent to the model); the model only
+    /// re-decides the windowed tail. Segments are assembled once the reply arrives (see
+    /// [`Self::on_seg_msg`]).
+    fn start_seg_from(&mut self, window_start: usize, tx: &UnboundedSender<SegMsg>) {
         if self.segments_loading {
             return;
         }
@@ -333,12 +430,23 @@ impl App {
             self.chat_log.push(ChatEntry::system("No model configured — can't segment.".into()));
             return;
         }
-        let (messages, map) = segment_request(&self.store);
+        let (messages, map) = segment_request_from(&self.store, window_start);
         if map.is_empty() {
             self.chat_log.push(ChatEntry::system("No activity to segment yet.".into()));
             return;
         }
+        // The window may be capped to the most recent MAX_EVENTS; freeze every existing
+        // segment that starts before the first listed event.
+        let effective_start = map[0];
+        self.seg_frozen = self
+            .segments
+            .iter()
+            .filter(|s| s.start_idx < effective_start)
+            .map(|s| (s.start_idx, s.title.clone()))
+            .collect();
         self.seg_map = map;
+        self.seg_total = self.seg_map.len();
+        self.seg_progress.clear();
         self.segments_loading = true;
         let stream = self.provider.as_ref().unwrap().stream_chat(messages);
         let tx = tx.clone();
@@ -346,9 +454,20 @@ impl App {
             let mut stream = stream;
             let mut out = String::new();
             let mut err = None;
+            let mut found = 0;
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(d) => out.push_str(&d),
+                    Ok(d) => {
+                        out.push_str(&d);
+                        // Surface each newly-completed boundary as it streams in.
+                        let titles = parse_partial_boundaries(&out);
+                        if titles.len() != found {
+                            found = titles.len();
+                            let _ = tx.send(SegMsg::Progress(
+                                titles.into_iter().map(|(_, t)| t).collect(),
+                            ));
+                        }
+                    }
                     Err(e) => {
                         err = Some(e.to_string());
                         break;
@@ -363,16 +482,68 @@ impl App {
     }
 
     fn on_seg_msg(&mut self, msg: SegMsg) {
-        self.segments_loading = false;
         match msg {
+            SegMsg::Progress(titles) => self.seg_progress = titles,
             SegMsg::Done(raw) => {
-                self.segments = build_segments(parse_boundaries(&raw), &self.seg_map, &self.store);
+                self.segments_loading = false;
+                self.seg_progress.clear();
+                // Frozen blocks + the model's windowed boundaries → full segment list.
+                let mut starts = boundaries_to_starts(parse_boundaries(&raw), &self.seg_map);
+                starts.append(&mut self.seg_frozen);
+                self.segments = build_segments_from_starts(starts, &self.store);
                 self.segments_sel = None;
+                self.seg_watermark = self.store.events.len();
+                self.persist_cache();
             }
             SegMsg::Error(e) => {
+                self.segments_loading = false;
+                self.seg_progress.clear();
+                self.seg_frozen.clear();
                 self.chat_log.push(ChatEntry::system(format!("Segmentation failed: {e}")));
             }
         }
+    }
+
+    /// Apply the persisted cache once the backfill is in: rebuild cached segments against the
+    /// real store, then segment only the new tail (or do a full pass if there's no usable
+    /// cache). Called the first time events arrive after attaching.
+    fn reconcile_on_backfill(&mut self, tx: &UnboundedSender<SegMsg>) {
+        let n = self.store.events.len();
+        match self.pending_cache.take() {
+            // Usable cache: rebuild its segments locally (no model call for the old part).
+            Some(c) if c.watermark <= n && !c.segments.is_empty() => {
+                self.segments = build_segments_from_starts(c.starts(), &self.store);
+                self.seg_watermark = c.watermark;
+                self.segments_sel = None;
+                if n > c.watermark {
+                    self.chat_log
+                        .push(ChatEntry::system("new activity since last visit — segmenting the tail…".into()));
+                    self.start_segmentation(false, tx); // incremental from the last block
+                }
+            }
+            // No (or stale) cache: full segmentation of the history.
+            _ => {
+                self.chat_log.push(ChatEntry::system("auto-segmenting session history…".into()));
+                self.start_segmentation(true, tx);
+            }
+        }
+        // Recompute the summary only if the restored one doesn't already cover these events.
+        self.summary_dirty = self.summary_len < n;
+    }
+
+    /// Write the current segments + summary to the per-session cache (best-effort).
+    fn persist_cache(&self) {
+        if self.session_id.is_empty() {
+            return;
+        }
+        let cache = session_cache::SessionCache::from_state(
+            self.session_id.clone(),
+            self.seg_watermark,
+            &self.segments,
+            self.glance_summary.clone(),
+            self.summary_len,
+        );
+        let _ = session_cache::save(&cache);
     }
 
     /// Dispatch an Enter press: slash commands run locally, everything else is a chat turn.
@@ -387,6 +558,7 @@ impl App {
         if input.is_empty() {
             return;
         }
+        self.record_history(&input);
         if !input.starts_with('/') {
             // While an explain-back is open, the next message is the answer to grade.
             if let Some(ex) = self.awaiting_explain.take() {
@@ -410,7 +582,11 @@ impl App {
         let cmd = parts.next().unwrap_or("");
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
-            "/segments" => self.start_segmentation(seg_tx),
+            "/segments" => {
+                // Default: incremental (extend the last block, add new ones). --force re-segments.
+                let force = matches!(arg, "--force" | "-f");
+                self.start_segmentation(force, seg_tx);
+            }
             "/debt" => self.cmd_debt(),
             "/explain" => self.start_explain(arg, explain_tx),
             "/tagging" => self.cmd_tagging(),
@@ -724,6 +900,8 @@ impl App {
         if let SummaryMsg::Done(s) = msg {
             if !s.is_empty() {
                 self.glance_summary = s;
+                self.summary_len = self.store.events.len();
+                self.persist_cache();
             }
         }
         // On error, keep the previous summary rather than blanking the panel.
@@ -767,6 +945,11 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
                     for e in events { app.store.add(e); }
                     app.summary_dirty = true;
                     app.last_event_at = Instant::now();
+                }
+                // First events for a session: apply any cache, then segment only the new tail.
+                if app.auto_segment_pending && !app.store.events.is_empty() {
+                    app.auto_segment_pending = false;
+                    app.reconcile_on_backfill(&channels.seg);
                 }
             }
             Some(msg) = chat_rx.recv() => app.on_chat_msg(msg),
@@ -815,8 +998,11 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
             KeyCode::Backspace => {
                 app.chat_input.pop();
             }
-            KeyCode::Up => app.nav_active(-1),
-            KeyCode::Down => app.nav_active(1),
+            // With a panel focused, ↑↓ scroll it; in pure chat mode they walk command history.
+            KeyCode::Up if app.active.is_some() => app.nav_active(-1),
+            KeyCode::Down if app.active.is_some() => app.nav_active(1),
+            KeyCode::Up => app.history_prev(),
+            KeyCode::Down => app.history_next(),
             KeyCode::PageUp => app.nav_active(-10),
             KeyCode::PageDown => app.nav_active(10),
             KeyCode::Char(c) => app.chat_input.push(c),
@@ -1023,10 +1209,22 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageR
     f.render_widget(block, area);
 
     if app.segments_loading {
-        f.render_widget(
-            Paragraph::new("segmenting…").style(Style::default().fg(Color::Yellow)),
-            inner,
-        );
+        let width = inner.width.saturating_sub(5) as usize;
+        let mut lines = vec![Line::styled(
+            format!("⟳ segmenting {} events · {} found", app.seg_total, app.seg_progress.len()),
+            Style::default().fg(Color::Yellow),
+        )];
+        if app.seg_progress.is_empty() {
+            lines.push(Line::styled("  reading the activity log…", Style::default().fg(Color::DarkGray)));
+        } else {
+            for (i, t) in app.seg_progress.iter().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{} ", i + 1), Style::default().fg(Color::DarkGray)),
+                    Span::raw(truncate(t, width)),
+                ]));
+            }
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
         return;
     }
     if app.segments.is_empty() {
