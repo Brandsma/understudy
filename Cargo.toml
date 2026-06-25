@@ -19,3 +19,4 @@ regex = "1"
 directories = "5"
 thiserror = "1"
 anyhow = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -17,6 +17,7 @@ use understudy_core::models::{build_provider, ChatMessage};
 use understudy_core::sources::claude_code::{
     discover_sessions, projects_dir, resolve_session, ClaudeCodeSource,
 };
+use understudy_core::sources::{discover_all, Source};
 use understudy_core::store::EventStore;
 
 mod tui;
@@ -87,15 +88,15 @@ fn pick_session(session: Option<String>, here: bool) -> Result<PathBuf> {
 }
 
 fn sessions() -> Result<()> {
-    let list = discover_sessions(None);
+    let list = discover_all(None);
     if list.is_empty() {
-        println!("no Claude Code sessions found under {}", projects_dir().display());
+        println!("no sessions found (looked under {} and the OpenCode database)", projects_dir().display());
         return Ok(());
     }
     for s in list.iter().take(40) {
         let project = s.cwd.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("?");
         let id = s.session_id.get(..8).unwrap_or(&s.session_id);
-        println!("{id}  {project:<26.26}  {:<14.14}  {}", s.git_branch, s.summary);
+        println!("{:<2}  {id}  {project:<24.24}  {:<12.12}  {}", s.agent.tag(), s.git_branch, s.summary);
     }
     Ok(())
 }

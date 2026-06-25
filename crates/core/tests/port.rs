@@ -8,6 +8,7 @@ use understudy_core::events::{Event, EventKind};
 use understudy_core::filters::{strip_think, ThinkFilter};
 use understudy_core::models::build_provider;
 use understudy_core::sources::claude_code::{read_session_meta, ClaudeCodeSource};
+use understudy_core::sources::Source;
 use understudy_core::store::EventStore;
 use understudy_core::summary::live_summary_messages;
 

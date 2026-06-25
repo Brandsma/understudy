@@ -72,6 +72,12 @@ impl Event {
     ) -> Self {
         Event { kind, ts, source: "claude-code".to_string(), turn_id, is_sidechain, raw_ref }
     }
+
+    /// Override the source tag (adapters other than Claude Code set their own).
+    pub fn with_source(mut self, source: &str) -> Self {
+        self.source = source.to_string();
+        self
+    }
 }
 
 /// Fallback "now" as a fixed-offset datetime (when a record lacks a timestamp).

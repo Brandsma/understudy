@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::context::clip;
 use crate::events::{now_fixed, Event, EventKind, Hunk, SourceInfo};
+use crate::sources::{Agent, SessionInfo, Source};
 use crate::store::basename;
 
 /// Cap synthesized "new file" diffs so a huge Write can't flood the detail pane.
@@ -39,17 +40,6 @@ pub fn projects_dir() -> PathBuf {
 // --------------------------------------------------------------------------- //
 // Discovery
 // --------------------------------------------------------------------------- //
-
-#[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub path: PathBuf,
-    pub session_id: String,
-    pub cwd: String,
-    pub git_branch: String,
-    pub modified: SystemTime,
-    pub size: u64,
-    pub summary: String,
-}
 
 /// All Claude Code sessions, newest first. Optionally filter by cwd.
 pub fn discover_sessions(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
@@ -95,6 +85,7 @@ pub fn read_session_meta(path: &Path) -> Option<SessionInfo> {
     }
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     Some(SessionInfo {
+        agent: Agent::ClaudeCode,
         path: path.to_path_buf(),
         session_id: head.get("sessionId").and_then(|v| v.as_str()).unwrap_or(stem).to_string(),
         cwd: head.get("cwd").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -191,6 +182,7 @@ pub fn info_from_path(path: &Path) -> SessionInfo {
     }
     let meta = std::fs::metadata(path).ok();
     SessionInfo {
+        agent: Agent::ClaudeCode,
         path: path.to_path_buf(),
         session_id: path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string(),
         cwd: String::new(),
@@ -261,31 +253,6 @@ impl ClaudeCodeSource {
                 title: None,
             }
         }
-    }
-
-    /// Read the whole file once; return the last `backfill_limit` normalized events.
-    pub fn backfill(&mut self) -> Vec<Event> {
-        self.offset = 0;
-        self.buf.clear();
-        let mut events = Vec::new();
-        for line in self.read_new_lines() {
-            events.extend(self.normalize_line(&line));
-        }
-        let n = self.backfill_limit;
-        if events.len() > n {
-            events.split_off(events.len() - n)
-        } else {
-            events
-        }
-    }
-
-    /// Read appended bytes since the last offset; normalize complete lines.
-    pub fn read_new(&mut self) -> Vec<Event> {
-        let mut events = Vec::new();
-        for line in self.read_new_lines() {
-            events.extend(self.normalize_line(&line));
-        }
-        events
     }
 
     fn read_new_lines(&mut self) -> Vec<String> {
@@ -484,6 +451,33 @@ impl ClaudeCodeSource {
             false,
             vstr_opt(rec, "uuid"),
         )]
+    }
+}
+
+impl Source for ClaudeCodeSource {
+    /// Read the whole file once; return the last `backfill_limit` normalized events.
+    fn backfill(&mut self) -> Vec<Event> {
+        self.offset = 0;
+        self.buf.clear();
+        let mut events = Vec::new();
+        for line in self.read_new_lines() {
+            events.extend(self.normalize_line(&line));
+        }
+        let n = self.backfill_limit;
+        if events.len() > n {
+            events.split_off(events.len() - n)
+        } else {
+            events
+        }
+    }
+
+    /// Read appended bytes since the last offset; normalize complete lines.
+    fn read_new(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        for line in self.read_new_lines() {
+            events.extend(self.normalize_line(&line));
+        }
+        events
     }
 }
 

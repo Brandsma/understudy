@@ -42,7 +42,7 @@ Rules:\n\
 - Return ONLY a JSON array, no prose and no markdown fences. Each element is {\"start\": <0-based line \
 number where the segment begins>, \"title\": \"<3-6 word description of that work>\"}.\n\
 - Segments must be in order, non-overlapping, and the first must start at line 0.\n\
-- Return at least 2 segments (typically 3-8). Never return a single segment that covers the whole log.\n\
+- Never return a single segment that covers the whole log.\n\
 - Title each segment with the concrete work it contains, e.g. \"Refactor event store\", \"Fix failing port \
 tests\", \"Add segmentation cache\". Never use vague catch-all titles like \"Session\", \"Whole session\", \
 \"Coding\", or \"Misc\".\n\
@@ -252,6 +252,7 @@ fn tidy_title(raw: &str) -> String {
 mod tests {
     use super::*;
     use crate::sources::claude_code::ClaudeCodeSource;
+    use crate::sources::Source;
     use std::path::PathBuf;
 
     fn fixture_store() -> EventStore {

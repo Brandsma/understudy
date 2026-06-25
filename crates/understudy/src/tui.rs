@@ -27,7 +27,7 @@ use understudy_core::segments::{
     boundaries_to_starts, build_segments_from_starts, parse_boundaries, parse_partial_boundaries,
     segment_request_from, Segment,
 };
-use understudy_core::sources::claude_code::{discover_sessions, ClaudeCodeSource, SessionInfo};
+use understudy_core::sources::{discover_all, open_source, Agent, SessionInfo};
 use understudy_core::store::EventStore;
 use understudy_core::summary::live_summary_messages;
 
@@ -40,7 +40,7 @@ const WIDE_ROWS: u16 = 12;
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Chat `/help` text.
 const HELP: &str = "commands: /segments [--force]  /debt  /explain [n]  /tagging  /follow  /session  /model [name]  \
-/clear  /help  ·  tab: focus a panel  ·  ↑↓: select  ·  esc: unpin → back";
+/clear  /help  ·  tab: focus a panel  ·  ↑↓ / j k (10j) / g G: move  ·  esc: unpin → back";
 
 enum Mode {
     Picker,
@@ -166,13 +166,14 @@ pub struct App {
     history: Vec<String>,       // submitted inputs, oldest first (shell-style command history)
     history_pos: Option<usize>, // browse cursor into `history`; None = editing the live draft
     draft: String,              // in-progress input stashed while browsing history
+    nav_count: String,          // pending vim count prefix (e.g. "10" before `j`), focused only
     should_quit: bool,
     tailer: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
     fn new() -> Self {
-        let sessions = discover_sessions(None);
+        let sessions = discover_all(None);
         let mut picker = ListState::default();
         if !sessions.is_empty() {
             picker.select(Some(0));
@@ -213,6 +214,7 @@ impl App {
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            nav_count: String::new(),
             should_quit: false,
             tailer: None,
         }
@@ -222,7 +224,7 @@ impl App {
         let Some(info) = self.picker.selected().and_then(|i| self.sessions.get(i)) else {
             return;
         };
-        let path = info.path.clone();
+        let info = info.clone();
         self.title = short_project(&info.cwd);
         self.branch = info.git_branch.clone();
         self.session_id = info.session_id.clone();
@@ -262,7 +264,7 @@ impl App {
         }
         let tx = tx.clone();
         self.tailer = Some(tokio::spawn(async move {
-            let mut src = ClaudeCodeSource::new(&path);
+            let mut src = open_source(&info);
             let _ = tx.send(src.backfill());
             loop {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -377,6 +379,67 @@ impl App {
         match self.active {
             Some(Panel::Activity) => self.nav_event(delta),
             Some(Panel::Segments) => self.nav_segment(delta),
+            _ => {}
+        }
+    }
+
+    /// Consume the pending vim count prefix as a positive step (default 1).
+    fn take_count(&mut self) -> i32 {
+        let n = self.nav_count.parse::<i32>().unwrap_or(1).max(1);
+        self.nav_count.clear();
+        n
+    }
+
+    /// Vim-style keys while a panel is focused: digits build a count, `j`/`k` move by it,
+    /// and `g`/`G` jump to the top/bottom. Returns false for any other key so it can fall
+    /// through to the chat input.
+    fn try_vim_key(&mut self, c: char) -> bool {
+        match c {
+            '1'..='9' => self.nav_count.push(c),
+            '0' if !self.nav_count.is_empty() => self.nav_count.push(c),
+            'j' => {
+                let n = self.take_count();
+                self.nav_active(n);
+            }
+            'k' => {
+                let n = self.take_count();
+                self.nav_active(-n);
+            }
+            'g' => {
+                self.nav_count.clear();
+                self.nav_to_edge(true);
+            }
+            'G' => {
+                self.nav_count.clear();
+                self.nav_to_edge(false);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Jump the focused panel to its first (`top`) or last entry.
+    fn nav_to_edge(&mut self, top: bool) {
+        match self.active {
+            Some(Panel::Activity) => {
+                let total = self.store.events.len();
+                if total == 0 {
+                    return;
+                }
+                let idx = if top { 0 } else { total - 1 };
+                self.activity_sel = Some(idx);
+                self.interactions.mark_seen(idx);
+            }
+            Some(Panel::Segments) => {
+                if self.segments.is_empty() {
+                    return;
+                }
+                let idx = if top { 0 } else { self.segments.len() - 1 };
+                self.segments_sel = Some(idx);
+                let start = self.segments[idx].start_idx;
+                self.activity_sel = Some(start);
+                self.interactions.mark_seen(start);
+            }
             _ => {}
         }
     }
@@ -981,10 +1044,17 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
         },
         // Chat-first: typing always goes to the input; Tab cycles which panel scrolls.
         Mode::Cockpit => match code {
-            KeyCode::Tab => app.cycle_panel(1),
-            KeyCode::BackTab => app.cycle_panel(-1),
+            KeyCode::Tab => {
+                app.nav_count.clear();
+                app.cycle_panel(1);
+            }
+            KeyCode::BackTab => {
+                app.nav_count.clear();
+                app.cycle_panel(-1);
+            }
             // Three-stage Esc: unfocus panel → unpin selection (resume live) → back to picker.
             KeyCode::Esc => {
+                app.nav_count.clear();
                 if app.active.is_some() {
                     app.active = None;
                 } else if app.activity_sel.is_some() {
@@ -998,14 +1068,27 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
             KeyCode::Backspace => {
                 app.chat_input.pop();
             }
-            // With a panel focused, ↑↓ scroll it; in pure chat mode they walk command history.
-            KeyCode::Up if app.active.is_some() => app.nav_active(-1),
-            KeyCode::Down if app.active.is_some() => app.nav_active(1),
+            // With a panel focused, ↑↓ scroll it (honoring a vim count); in pure chat mode
+            // they walk command history.
+            KeyCode::Up if app.active.is_some() => {
+                let n = app.take_count();
+                app.nav_active(-n);
+            }
+            KeyCode::Down if app.active.is_some() => {
+                let n = app.take_count();
+                app.nav_active(n);
+            }
             KeyCode::Up => app.history_prev(),
             KeyCode::Down => app.history_next(),
             KeyCode::PageUp => app.nav_active(-10),
             KeyCode::PageDown => app.nav_active(10),
-            KeyCode::Char(c) => app.chat_input.push(c),
+            // While a panel is focused, vim motions (j/k, g/G, count prefix) navigate it;
+            // every other character still goes to the chat input.
+            KeyCode::Char(c) if app.active.is_some() && app.try_vim_key(c) => {}
+            KeyCode::Char(c) => {
+                app.nav_count.clear();
+                app.chat_input.push(c);
+            }
             _ => {}
         },
     }
@@ -1029,6 +1112,7 @@ fn ui(f: &mut Frame, app: &mut App) {
 
 fn draw_picker(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
+    let nerd = use_nerd_icons();
     let items: Vec<ListItem> = app
         .sessions
         .iter()
@@ -1036,9 +1120,11 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
             let project = short_project(&s.cwd);
             let branch = if s.git_branch.is_empty() { "—" } else { &s.git_branch };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{project:<26.26} "), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{branch:<14.14} "), Style::default().fg(Color::DarkGray)),
-                Span::raw(truncate(&s.summary, 60)),
+                agent_cell(s.agent, nerd),
+                Span::raw("  "),
+                Span::styled(format!("{project:<22.22} "), Style::default().fg(Color::Cyan)),
+                Span::styled(format!("{branch:<12.12} "), Style::default().fg(Color::DarkGray)),
+                Span::raw(truncate(&s.summary, 50)),
             ]))
         })
         .collect();
@@ -1051,6 +1137,41 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
         Paragraph::new(" ↑↓ select · enter attach · ^q quit").style(Style::default().fg(Color::DarkGray)),
         chunks[1],
     );
+}
+
+/// Nerd Font glyphs can't be reliably detected from inside a terminal, so they're opt-in via
+/// `UNDERSTUDY_ICONS=nerd`; otherwise the picker uses colored text tags.
+fn use_nerd_icons() -> bool {
+    std::env::var("UNDERSTUDY_ICONS").map(|v| v.eq_ignore_ascii_case("nerd")).unwrap_or(false)
+}
+
+/// A colored "<icon> <name>" cell identifying which coding agent a session came from.
+fn agent_cell(agent: Agent, nerd: bool) -> Span<'static> {
+    let icon = if nerd { agent_glyph(agent) } else { agent.tag() };
+    Span::styled(format!("{icon} {:<11.11}", agent.name()), Style::default().fg(agent_color(agent)))
+}
+
+fn agent_color(agent: Agent) -> Color {
+    match agent {
+        Agent::ClaudeCode => Color::Rgb(217, 119, 87), // Anthropic clay
+        Agent::OpenCode => Color::Cyan,
+        Agent::Copilot => Color::Green,
+        Agent::Codex => Color::Magenta,
+        Agent::GeminiCli => Color::Blue,
+        Agent::Unknown => Color::DarkGray,
+    }
+}
+
+/// Nerd Font (v3, Font Awesome range) glyphs per agent; only rendered in nerd-icon mode.
+fn agent_glyph(agent: Agent) -> &'static str {
+    match agent {
+        Agent::ClaudeCode => "\u{f544}", // robot
+        Agent::OpenCode => "\u{f121}",   // code
+        Agent::Copilot => "\u{f09b}",    // github
+        Agent::Codex => "\u{f120}",      // terminal
+        Agent::GeminiCli => "\u{f1a0}",  // google
+        Agent::Unknown => "\u{f059}",    // question-circle
+    }
 }
 
 fn draw_cockpit(f: &mut Frame, app: &App) {
@@ -1462,7 +1583,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else {
         "esc sessions"
     };
-    let hint = format!(" tab panes · ↑↓ select · enter send · /segments · {esc} · ^q quit");
+    // While a panel is focused, surface the vim motions; otherwise the chat-mode hint.
+    let nav = if app.active.is_some() { "j k (10j) · g G ends" } else { "↑↓ select" };
+    let hint = format!(" tab panes · {nav} · enter send · /segments · {esc} · ^q quit");
     f.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)), area);
 }
 
@@ -1582,6 +1705,7 @@ mod tests {
     use ratatui::Terminal;
     use std::path::PathBuf;
     use understudy_core::sources::claude_code::ClaudeCodeSource;
+    use understudy_core::sources::Source;
 
     fn fixture_store() -> EventStore {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/sample_session.jsonl");

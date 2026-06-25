@@ -15,6 +15,7 @@ async-stream = { workspace = true }
 regex = { workspace = true }
 directories = { workspace = true }
 thiserror = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
