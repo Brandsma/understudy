@@ -5,8 +5,13 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::event::{Event as CEvent, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as CEvent, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
 use futures::StreamExt;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
@@ -39,7 +44,7 @@ const WIDE_ROWS: u16 = 12;
 /// Quiet period after the last event before the Tier-2 summary is (re)computed.
 const SUMMARY_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// Chat `/help` text.
-const HELP: &str = "commands: /segments [--force]  /debt  /explain [n]  /tagging  /follow  /session  /model [name]  \
+const HELP: &str = "commands: /segments [--force]  /debt  /explain [n]  /show thinking  /tagging  /follow  /session  /model [name]  \
 /clear  /help  ·  tab: focus a panel  ·  ↑↓ / j k (10j) / g G: move  ·  esc: unpin → back";
 
 enum Mode {
@@ -133,7 +138,9 @@ struct Channels {
 pub struct App {
     mode: Mode,
     sessions: Vec<SessionInfo>,
-    picker: ListState,
+    picker: ListState,            // selection index into the *visible* (filtered) sessions
+    picker_query: String,         // fuzzy filter typed in the picker (matches agent + title)
+    agent_filter: Option<Agent>,  // None = all agents; cycled with Tab
     store: EventStore,
     title: String,
     branch: String,
@@ -141,6 +148,7 @@ pub struct App {
     scroll: u16, // activity lines scrolled up from the bottom (0 = following)
     activity_sel: Option<usize>, // selected event index while Activity is focused
     active: Option<Panel>,
+    show_thinking: bool, // Thinking panel visible (top-right); when off, Detail takes the column
     provider: Option<Provider>,
     segments: Vec<Segment>,
     segments_sel: Option<usize>,
@@ -169,6 +177,12 @@ pub struct App {
     nav_count: String,          // pending vim count prefix (e.g. "10" before `j`), focused only
     should_quit: bool,
     tailer: Option<tokio::task::JoinHandle<()>>,
+    // Mouse: the full area last drawn (for hit-testing) and the active drag-selection in
+    // terminal coordinates (x, y). `copy_pending` requests a clipboard copy on the next draw.
+    last_area: Rect,
+    sel_anchor: Option<(u16, u16)>,
+    sel_cursor: Option<(u16, u16)>,
+    copy_pending: bool,
 }
 
 impl App {
@@ -182,6 +196,8 @@ impl App {
             mode: Mode::Picker,
             sessions,
             picker,
+            picker_query: String::new(),
+            agent_filter: None,
             store: EventStore::new(),
             title: String::new(),
             branch: String::new(),
@@ -189,6 +205,7 @@ impl App {
             scroll: 0,
             activity_sel: None,
             active: None,
+            show_thinking: false,
             provider: build_provider(&load_config().provider),
             segments: Vec::new(),
             segments_sel: None,
@@ -217,11 +234,79 @@ impl App {
             nav_count: String::new(),
             should_quit: false,
             tailer: None,
+            last_area: Rect::default(),
+            sel_anchor: None,
+            sel_cursor: None,
+            copy_pending: false,
         }
     }
 
+    /// Indices into `self.sessions` that pass the active agent filter and fuzzy query, in the
+    /// original (newest-first) order. Every whitespace-separated query token must appear as a
+    /// case-insensitive subsequence of "<agent name> <title>".
+    fn visible_indices(&self) -> Vec<usize> {
+        let tokens: Vec<String> =
+            self.picker_query.to_lowercase().split_whitespace().map(str::to_string).collect();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.agent_filter.is_none_or(|a| s.agent == a))
+            .filter(|(_, s)| {
+                tokens.is_empty() || {
+                    let hay = format!("{} {}", s.agent.name(), s.summary).to_lowercase();
+                    tokens.iter().all(|t| is_subsequence(t, &hay))
+                }
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The session currently highlighted in the filtered list, if any.
+    fn selected_session(&self) -> Option<&SessionInfo> {
+        let vis = self.visible_indices();
+        self.picker.selected().and_then(|i| vis.get(i)).and_then(|&idx| self.sessions.get(idx))
+    }
+
+    /// Re-anchor the selection to the top of the (re-filtered) list, or clear it if empty.
+    fn reset_picker_selection(&mut self) {
+        let has_rows = !self.visible_indices().is_empty();
+        self.picker.select(has_rows.then_some(0));
+    }
+
+    /// Agents present in the session list, in canonical order (drives the Tab cycle so it
+    /// never lands on an agent with zero sessions).
+    fn present_agents(&self) -> Vec<Agent> {
+        const ORDER: [Agent; 7] = [
+            Agent::ClaudeCode,
+            Agent::OpenCode,
+            Agent::Copilot,
+            Agent::Codex,
+            Agent::GeminiCli,
+            Agent::Antigravity,
+            Agent::Unknown,
+        ];
+        ORDER.into_iter().filter(|a| self.sessions.iter().any(|s| s.agent == *a)).collect()
+    }
+
+    /// Cycle the agent filter `All → <each present agent> → All` (`dir > 0`) or in reverse.
+    fn cycle_agent_filter(&mut self, dir: i32) {
+        let agents = self.present_agents();
+        if agents.is_empty() {
+            return;
+        }
+        // The cycle is `None` (All) followed by each present agent.
+        let cur = match self.agent_filter {
+            None => 0,
+            Some(a) => agents.iter().position(|&x| x == a).map(|i| i + 1).unwrap_or(0),
+        };
+        let len = agents.len() as i32 + 1;
+        let next = (cur as i32 + dir).rem_euclid(len) as usize;
+        self.agent_filter = (next > 0).then(|| agents[next - 1]);
+        self.reset_picker_selection();
+    }
+
     fn attach(&mut self, tx: &UnboundedSender<Vec<Event>>) {
-        let Some(info) = self.picker.selected().and_then(|i| self.sessions.get(i)) else {
+        let Some(info) = self.selected_session() else {
             return;
         };
         let info = info.clone();
@@ -345,7 +430,11 @@ impl App {
 
     /// Cycle the active (Tab-focusable) panel forward (`dir > 0`) or backward.
     fn cycle_panel(&mut self, dir: i32) {
-        let order = [Panel::Activity, Panel::Segments, Panel::Thinking];
+        let order: &[Panel] = if self.show_thinking {
+            &[Panel::Activity, Panel::Segments, Panel::Thinking]
+        } else {
+            &[Panel::Activity, Panel::Segments]
+        };
         let cur = self.active.and_then(|p| order.iter().position(|&q| q == p));
         let next = match cur {
             // None → first (fwd) or last (back)
@@ -371,6 +460,34 @@ impl App {
         // re-appears; on the first focus (nothing pinned) land on the most recent line.
         if self.active == Some(Panel::Activity) && self.activity_sel.is_none() {
             self.nav_event(0); // delta 0 → defaults to the latest event and marks it seen
+        }
+    }
+
+    /// Which focusable panel (if any) sits under a terminal coordinate, using the layout from
+    /// the last drawn frame. Only the Tab-focusable panels (Activity / Segments / Thinking) are
+    /// reported; passive readouts and the chat spine return `None`.
+    fn panel_at(&self, x: u16, y: u16) -> Option<Panel> {
+        if !matches!(self.mode, Mode::Cockpit) {
+            return None;
+        }
+        let l = cockpit_layout(self.last_area, self.show_thinking);
+        let p = Position { x, y };
+        if l.activity.contains(p) {
+            Some(Panel::Activity)
+        } else if l.segments.contains(p) {
+            Some(Panel::Segments)
+        } else if l.thinking.contains(p) {
+            Some(Panel::Thinking)
+        } else {
+            None
+        }
+    }
+
+    /// Focus a panel (e.g. from a mouse click), mirroring `cycle_panel`'s auto-select on Activity.
+    fn focus_panel(&mut self, p: Panel) {
+        self.active = Some(p);
+        if p == Panel::Activity && self.activity_sel.is_none() {
+            self.nav_event(0);
         }
     }
 
@@ -652,6 +769,7 @@ impl App {
             }
             "/debt" => self.cmd_debt(),
             "/explain" => self.start_explain(arg, explain_tx),
+            "/show" => self.cmd_show(arg),
             "/tagging" => self.cmd_tagging(),
             "/session" => self.back_to_picker(),
             "/follow" => {
@@ -664,6 +782,29 @@ impl App {
             other => self
                 .chat_log
                 .push(ChatEntry::system(format!("unknown command: {other} (try /help)"))),
+        }
+    }
+
+    /// Toggle visibility of a named panel: `/show thinking`. When the Thinking panel is
+    /// hidden, Detail takes its whole right column.
+    fn cmd_show(&mut self, arg: &str) {
+        match arg {
+            "thinking" => {
+                self.show_thinking = !self.show_thinking;
+                // Don't leave focus stranded on a now-hidden panel.
+                if !self.show_thinking && self.active == Some(Panel::Thinking) {
+                    self.active = None;
+                }
+                let state = if self.show_thinking { "shown" } else { "hidden" };
+                self.chat_log
+                    .push(ChatEntry::system(format!("thinking panel {state}")));
+            }
+            "" => self
+                .chat_log
+                .push(ChatEntry::system("usage: /show thinking".into())),
+            other => self
+                .chat_log
+                .push(ChatEntry::system(format!("unknown panel: {other} (try /show thinking)"))),
         }
     }
 
@@ -973,7 +1114,10 @@ impl App {
 
 pub async fn run() -> Result<()> {
     let mut terminal = ratatui::init();
+    // Capture the mouse so we can scroll the hovered panel, click to focus, and drag-select.
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = event_loop(&mut terminal).await;
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -997,10 +1141,12 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
         }
         tokio::select! {
             maybe = reader.next() => {
-                if let Some(Ok(CEvent::Key(key))) = maybe {
-                    if key.kind == KeyEventKind::Press {
+                match maybe {
+                    Some(Ok(CEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         handle_key(&mut app, key.code, key.modifiers, &channels);
                     }
+                    Some(Ok(CEvent::Mouse(m))) => handle_mouse(&mut app, m),
+                    _ => {}
                 }
             }
             Some(events) = ev_rx.recv() => {
@@ -1027,6 +1173,10 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
+    // Any keyboard interaction dismisses a lingering mouse selection highlight.
+    app.sel_anchor = None;
+    app.sel_cursor = None;
+
     // Global quit (works even while typing in the chat input).
     if matches!(code, KeyCode::Char('c') | KeyCode::Char('q')) && mods.contains(KeyModifiers::CONTROL) {
         app.persist();
@@ -1035,11 +1185,32 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
     }
 
     match app.mode {
+        // Type to fuzzy-filter; arrows select; Tab cycles the agent filter. (^q quits, above.)
         Mode::Picker => match code {
-            KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Up | KeyCode::Char('k') => move_picker(app, -1),
-            KeyCode::Down | KeyCode::Char('j') => move_picker(app, 1),
+            KeyCode::Up => move_picker(app, -1),
+            KeyCode::Down => move_picker(app, 1),
             KeyCode::Enter => app.attach(&ch.ev),
+            KeyCode::Tab => app.cycle_agent_filter(1),
+            KeyCode::BackTab => app.cycle_agent_filter(-1),
+            // Esc clears the typed query first, then the agent filter.
+            KeyCode::Esc => {
+                if !app.picker_query.is_empty() {
+                    app.picker_query.clear();
+                    app.reset_picker_selection();
+                } else if app.agent_filter.is_some() {
+                    app.agent_filter = None;
+                    app.reset_picker_selection();
+                }
+            }
+            KeyCode::Backspace => {
+                if app.picker_query.pop().is_some() {
+                    app.reset_picker_selection();
+                }
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.picker_query.push(c);
+                app.reset_picker_selection();
+            }
             _ => {}
         },
         // Chat-first: typing always goes to the input; Tab cycles which panel scrolls.
@@ -1094,29 +1265,183 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers, ch: &Channels) {
     }
 }
 
-fn move_picker(app: &mut App, delta: i32) {
-    if app.sessions.is_empty() {
+/// Mouse routing: wheel scrolls the hovered panel, left-drag selects text (copied on release),
+/// and a left-click (press+release without moving) focuses the panel under the cursor.
+fn handle_mouse(app: &mut App, m: MouseEvent) {
+    let (x, y) = (m.column, m.row);
+    match m.kind {
+        MouseEventKind::ScrollUp => scroll_at(app, x, y, -1),
+        MouseEventKind::ScrollDown => scroll_at(app, x, y, 1),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Begin a potential drag-selection; a release without movement becomes a click.
+            app.sel_anchor = Some((x, y));
+            app.sel_cursor = Some((x, y));
+            app.copy_pending = false;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if app.sel_anchor.is_some() {
+                app.sel_cursor = Some((x, y));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => finish_left_button(app, x, y),
+        _ => {}
+    }
+}
+
+/// Scroll whatever the cursor is over — no focus change required.
+fn scroll_at(app: &mut App, x: u16, y: u16, delta: i32) {
+    match app.mode {
+        Mode::Picker => move_picker(app, delta),
+        Mode::Cockpit => match app.panel_at(x, y) {
+            Some(Panel::Activity) => app.nav_event(delta),
+            Some(Panel::Segments) => app.nav_segment(delta),
+            _ => {} // Thinking / Detail / Glance / chat carry no scroll model
+        },
+    }
+}
+
+/// Resolve a left-button release: a real drag requests a clipboard copy; a stationary click
+/// focuses the panel underneath (and dismisses any empty selection).
+fn finish_left_button(app: &mut App, x: u16, y: u16) {
+    match app.sel_anchor {
+        Some(a) if a != (x, y) => {
+            app.sel_cursor = Some((x, y));
+            app.copy_pending = true; // text is extracted from the buffer on the next draw
+        }
+        Some(_) => {
+            app.sel_anchor = None;
+            app.sel_cursor = None;
+            if let Some(p) = app.panel_at(x, y) {
+                app.focus_panel(p);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Order two points in reading order (row, then column).
+fn order_points(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Column span `[x0, x1]` selected on row `y` for a linear selection from `start` to `end`.
+fn row_span(y: u16, start: (u16, u16), end: (u16, u16), width: u16) -> (u16, u16) {
+    let last = width.saturating_sub(1);
+    if start.1 == end.1 {
+        (start.0, end.0)
+    } else if y == start.1 {
+        (start.0, last)
+    } else if y == end.1 {
+        (0, end.0)
+    } else {
+        (0, last)
+    }
+}
+
+/// Highlight the active drag-selection (reversed video) and, when a copy was just requested,
+/// extract the selected cells from the freshly rendered buffer onto the system clipboard.
+fn apply_selection(f: &mut Frame, app: &mut App) {
+    let (Some(anchor), Some(cursor)) = (app.sel_anchor, app.sel_cursor) else {
+        return;
+    };
+    if anchor == cursor {
+        return; // a click, or a drag that hasn't moved yet — nothing to highlight
+    }
+    let width = f.area().width;
+    let (start, end) = order_points(anchor, cursor);
+    let buf = f.buffer_mut();
+
+    // Reversed video over the selected cells.
+    for y in start.1..=end.1 {
+        let (x0, x1) = row_span(y, start, end, width);
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+
+    if app.copy_pending {
+        app.copy_pending = false;
+        copy_to_clipboard(&selection_text(buf, start, end, width));
+    }
+}
+
+/// Extract the selected region of `buf` as text: trailing spaces trimmed per row, rows joined
+/// by newlines. `start`/`end` are in reading order (see `order_points`).
+fn selection_text(buf: &Buffer, start: (u16, u16), end: (u16, u16), width: u16) -> String {
+    let mut text = String::new();
+    for y in start.1..=end.1 {
+        let (x0, x1) = row_span(y, start, end, width);
+        let mut line = String::new();
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell(Position { x, y }) {
+                line.push_str(cell.symbol());
+            }
+        }
+        text.push_str(line.trim_end());
+        if y < end.1 {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// Best-effort write to the system clipboard.
+fn copy_to_clipboard(text: &str) {
+    if text.is_empty() {
         return;
     }
-    let n = app.sessions.len() as i32;
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        let _ = cb.set_text(text.to_string());
+    }
+}
+
+/// Case-insensitive subsequence test: do all chars of `needle` appear in `haystack`, in order?
+/// Both arguments are expected to be already lowercased.
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut hay = haystack.chars();
+    'next: for nc in needle.chars() {
+        for hc in hay.by_ref() {
+            if hc == nc {
+                continue 'next;
+            }
+        }
+        return false; // ran out of haystack before matching this needle char
+    }
+    true
+}
+
+fn move_picker(app: &mut App, delta: i32) {
+    let n = app.visible_indices().len() as i32;
+    if n == 0 {
+        return;
+    }
     let cur = app.picker.selected().unwrap_or(0) as i32;
     app.picker.select(Some((cur + delta).rem_euclid(n) as usize));
 }
 
 fn ui(f: &mut Frame, app: &mut App) {
+    app.last_area = f.area(); // remembered for mouse hit-testing between frames
     match app.mode {
         Mode::Picker => draw_picker(f, app),
         Mode::Cockpit => draw_cockpit(f, app),
     }
+    apply_selection(f, app); // drag-highlight on top of everything; copies when released
 }
 
 fn draw_picker(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(f.area());
     let nerd = use_nerd_icons();
-    let items: Vec<ListItem> = app
-        .sessions
+    let visible = app.visible_indices();
+    let items: Vec<ListItem> = visible
         .iter()
-        .map(|s| {
+        .map(|&i| {
+            let s = &app.sessions[i];
             let project = short_project(&s.cwd);
             let branch = if s.git_branch.is_empty() { "—" } else { &s.git_branch };
             ListItem::new(Line::from(vec![
@@ -1128,15 +1453,34 @@ fn draw_picker(f: &mut Frame, app: &mut App) {
             ]))
         })
         .collect();
+    // Title carries the active agent filter; "all" when unset.
+    let scope = app.agent_filter.map(Agent::name).unwrap_or("all");
+    let title = format!(
+        " Understudy — select a session (read-only)  ·  agent: {scope} [{}/{}] ",
+        visible.len(),
+        app.sessions.len()
+    );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Understudy — select a session (read-only) "))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("▌");
     f.render_stateful_widget(list, chunks[0], &mut app.picker);
-    f.render_widget(
-        Paragraph::new(" ↑↓ select · enter attach · ^q quit").style(Style::default().fg(Color::DarkGray)),
-        chunks[1],
-    );
+    f.render_widget(draw_picker_footer(app), chunks[1]);
+}
+
+/// Picker footer: the live fuzzy query (with cursor) when typing, else the key hints.
+fn draw_picker_footer(app: &App) -> Paragraph<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    if app.picker_query.is_empty() {
+        Paragraph::new(" type to filter · ↑↓ select · tab agent · enter attach · ^q quit").style(dim)
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled(" filter: ", dim),
+            Span::styled(app.picker_query.clone(), Style::default().fg(Color::Yellow)),
+            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::styled("  ·  esc clears · tab agent · enter attach", dim),
+        ]))
+    }
 }
 
 /// Nerd Font glyphs can't be reliably detected from inside a terminal, so they're opt-in via
@@ -1176,20 +1520,31 @@ fn agent_glyph(agent: Agent) -> &'static str {
     }
 }
 
-fn draw_cockpit(f: &mut Frame, app: &App) {
+/// Where each cockpit panel landed this frame. Absent panels (narrow layout, hidden Thinking)
+/// are `Rect::default()` (zero-area), so hit-tests against them never match. Computed once and
+/// shared by the renderer and mouse hit-testing so the two can't drift.
+#[derive(Clone, Copy, Default)]
+struct CockpitLayout {
+    status: Rect,
+    glance: Rect,
+    segments: Rect,
+    activity: Rect,
+    thinking: Rect,
+    detail: Rect,
+    chat: Rect,
+    footer: Rect,
+}
+
+fn cockpit_layout(area: Rect, show_thinking: bool) -> CockpitLayout {
     let v = Layout::vertical([
         Constraint::Length(1),       // status bar
         Constraint::Min(0),          // panel grid
         Constraint::Length(CHAT_H),  // chat spine
         Constraint::Length(1),       // footer
     ])
-    .split(f.area());
+    .split(area);
 
-    // Comprehension Coverage is only meaningful once segments exist.
-    let report = (!app.segments.is_empty()).then(|| coverage(&app.segments, &app.interactions));
-
-    draw_status(f, app, v[0], report.as_ref());
-
+    let mut l = CockpitLayout { status: v[0], chat: v[2], footer: v[3], ..Default::default() };
     let body = v[1];
     if body.width >= WIDE_COLS && body.height >= WIDE_ROWS {
         let cols = Layout::horizontal([
@@ -1199,21 +1554,45 @@ fn draw_cockpit(f: &mut Frame, app: &App) {
         ])
         .split(body);
         let left = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(cols[0]);
-        draw_glance(f, app, left[0]);
-        draw_segments(f, app, left[1], report.as_ref());
-        draw_activity(f, app, cols[1]);
-        let right = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(cols[2]);
-        draw_thinking(f, app, right[0]);
-        draw_detail(f, app, right[1]);
+        l.glance = left[0];
+        l.segments = left[1];
+        l.activity = cols[1];
+        if show_thinking {
+            let right = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)]).split(cols[2]);
+            l.thinking = right[0];
+            l.detail = right[1];
+        } else {
+            l.detail = cols[2];
+        }
     } else {
         // Stacked fallback: Glance + Activity, chat never sacrificed.
         let rows = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(body);
-        draw_glance(f, app, rows[0]);
-        draw_activity(f, app, rows[1]);
+        l.glance = rows[0];
+        l.activity = rows[1];
     }
+    l
+}
 
-    draw_chat_spine(f, app, v[2]);
-    draw_footer(f, app, v[3]);
+fn draw_cockpit(f: &mut Frame, app: &App) {
+    let l = cockpit_layout(f.area(), app.show_thinking);
+
+    // Comprehension Coverage is only meaningful once segments exist.
+    let report = (!app.segments.is_empty()).then(|| coverage(&app.segments, &app.interactions));
+
+    draw_status(f, app, l.status, report.as_ref());
+    draw_glance(f, app, l.glance);
+    draw_activity(f, app, l.activity);
+    if !l.segments.is_empty() {
+        draw_segments(f, app, l.segments, report.as_ref());
+    }
+    if !l.detail.is_empty() {
+        draw_detail(f, app, l.detail);
+    }
+    if !l.thinking.is_empty() {
+        draw_thinking(f, app, l.thinking);
+    }
+    draw_chat_spine(f, app, l.chat);
+    draw_footer(f, app, l.footer);
 }
 
 fn panel_block(title: &str, active: bool) -> Block<'static> {
@@ -1742,6 +2121,7 @@ mod tests {
     #[test]
     fn wide_cockpit_renders_all_panels() {
         let mut app = cockpit_app();
+        app.show_thinking = true; // Thinking is opt-in (/show thinking); enable it to assert the full layout.
         let mut terminal = Terminal::new(TestBackend::new(130, 40)).unwrap();
         terminal.draw(|f| ui(f, &mut app)).unwrap();
         let text = buffer_text(terminal.backend().buffer());
@@ -1771,9 +2151,181 @@ mod tests {
         assert!(buffer_text(terminal.backend().buffer()).contains("select a session"));
     }
 
+    fn session(agent: Agent, summary: &str) -> SessionInfo {
+        SessionInfo {
+            agent,
+            path: PathBuf::new(),
+            session_id: summary.to_string(),
+            cwd: "/work/proj".into(),
+            git_branch: "main".into(),
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            size: 0,
+            summary: summary.into(),
+        }
+    }
+
+    fn picker_app(sessions: Vec<SessionInfo>) -> App {
+        let mut app = App::new();
+        app.sessions = sessions;
+        app.picker_query.clear();
+        app.agent_filter = None;
+        app.reset_picker_selection();
+        app
+    }
+
+    #[test]
+    fn fuzzy_query_filters_on_agent_and_title() {
+        let mut app = picker_app(vec![
+            session(Agent::ClaudeCode, "Fix the parser"),
+            session(Agent::OpenCode, "Parse config flags"),
+            session(Agent::Copilot, "Refactor renderer"),
+        ]);
+        // Tokens span agent name + title, as a subsequence: "claud pars" → "claude code … parser".
+        app.picker_query = "claud pars".into();
+        assert_eq!(app.visible_indices(), vec![0]);
+        // A token can match the title alone.
+        app.picker_query = "refac".into();
+        assert_eq!(app.visible_indices(), vec![2]);
+        // …or the agent name.
+        app.picker_query = "opencode".into();
+        assert_eq!(app.visible_indices(), vec![1]);
+        // No match.
+        app.picker_query = "zzqq".into();
+        assert!(app.visible_indices().is_empty());
+    }
+
+    #[test]
+    fn tab_cycles_agent_filter_through_present_agents_only() {
+        // OpenCode is absent, so the cycle must skip it.
+        let mut app = picker_app(vec![
+            session(Agent::ClaudeCode, "a"),
+            session(Agent::Copilot, "b"),
+        ]);
+        assert_eq!(app.agent_filter, None); // all
+        app.cycle_agent_filter(1);
+        assert_eq!(app.agent_filter, Some(Agent::ClaudeCode));
+        app.cycle_agent_filter(1);
+        assert_eq!(app.agent_filter, Some(Agent::Copilot)); // skipped OpenCode
+        app.cycle_agent_filter(1);
+        assert_eq!(app.agent_filter, None); // wrapped back to all
+        app.cycle_agent_filter(-1);
+        assert_eq!(app.agent_filter, Some(Agent::Copilot)); // reverse
+    }
+
+    #[test]
+    fn selection_follows_filtered_list() {
+        let mut app = picker_app(vec![
+            session(Agent::ClaudeCode, "alpha"),
+            session(Agent::OpenCode, "beta"),
+            session(Agent::Copilot, "gamma"),
+        ]);
+        app.agent_filter = Some(Agent::Copilot);
+        app.reset_picker_selection();
+        // Only "gamma" is visible; row 0 must resolve back to sessions[2].
+        assert_eq!(app.selected_session().map(|s| s.summary.as_str()), Some("gamma"));
+    }
+
+    #[test]
+    fn empty_result_clears_selection() {
+        let mut app = picker_app(vec![session(Agent::ClaudeCode, "alpha")]);
+        app.picker_query = "zzz".into();
+        app.reset_picker_selection();
+        assert_eq!(app.picker.selected(), None);
+        assert!(app.selected_session().is_none());
+    }
+
+    fn wide_cockpit() -> (App, CockpitLayout) {
+        let mut app = cockpit_app();
+        app.show_thinking = true;
+        app.last_area = Rect::new(0, 0, 130, 40);
+        let l = cockpit_layout(app.last_area, true);
+        (app, l)
+    }
+
+    fn center(r: Rect) -> (u16, u16) {
+        (r.x + r.width / 2, r.y + r.height / 2)
+    }
+
+    #[test]
+    fn panel_at_hit_tests_only_focusable_panels() {
+        let (app, l) = wide_cockpit();
+        let (ax, ay) = center(l.activity);
+        assert_eq!(app.panel_at(ax, ay), Some(Panel::Activity));
+        let (sx, sy) = center(l.segments);
+        assert_eq!(app.panel_at(sx, sy), Some(Panel::Segments));
+        let (tx, ty) = center(l.thinking);
+        assert_eq!(app.panel_at(tx, ty), Some(Panel::Thinking));
+        // Passive readouts and the chat spine never report a focusable panel.
+        assert_eq!(app.panel_at(center(l.glance).0, center(l.glance).1), None);
+        assert_eq!(app.panel_at(center(l.detail).0, center(l.detail).1), None);
+        assert_eq!(app.panel_at(center(l.chat).0, center(l.chat).1), None);
+    }
+
+    #[test]
+    fn click_focuses_panel_drag_requests_copy() {
+        let (mut app, l) = wide_cockpit();
+        // Stationary press+release on Segments = a click → focus it.
+        let (sx, sy) = center(l.segments);
+        app.sel_anchor = Some((sx, sy));
+        app.sel_cursor = Some((sx, sy));
+        finish_left_button(&mut app, sx, sy);
+        assert_eq!(app.active, Some(Panel::Segments));
+        assert!(app.sel_anchor.is_none()); // click clears the empty selection
+
+        // A drag (moved before release) requests a copy and does not focus.
+        app.active = None;
+        app.sel_anchor = Some((sx, sy));
+        app.sel_cursor = Some((sx, sy));
+        finish_left_button(&mut app, sx + 4, sy + 1);
+        assert!(app.copy_pending);
+        assert_eq!(app.sel_cursor, Some((sx + 4, sy + 1)));
+        assert_eq!(app.active, None);
+    }
+
+    #[test]
+    fn scroll_moves_hovered_panel() {
+        let (mut app, l) = wide_cockpit();
+        let total = app.store.events.len();
+        assert!(total >= 2, "fixture needs at least two events");
+        // Hover Activity and scroll up: selection steps back one event from the latest.
+        app.activity_sel = None;
+        let (ax, ay) = center(l.activity);
+        scroll_at(&mut app, ax, ay, -1);
+        assert_eq!(app.activity_sel, Some(total - 2));
+        // Hovering a non-scrollable panel (Detail) does nothing.
+        let pinned = app.activity_sel;
+        scroll_at(&mut app, center(l.detail).0, center(l.detail).1, -1);
+        assert_eq!(app.activity_sel, pinned);
+    }
+
+    #[test]
+    fn order_points_sorts_reading_order() {
+        assert_eq!(order_points((7, 2), (3, 0)), ((3, 0), (7, 2)));
+        assert_eq!(order_points((5, 1), (2, 1)), ((2, 1), (5, 1))); // same row → by column
+    }
+
+    #[test]
+    fn row_span_widens_interior_rows() {
+        assert_eq!(row_span(0, (3, 0), (7, 0), 80), (3, 7)); // single row
+        assert_eq!(row_span(0, (3, 0), (7, 2), 80), (3, 79)); // first row → to right edge
+        assert_eq!(row_span(1, (3, 0), (7, 2), 80), (0, 79)); // middle row → full width
+        assert_eq!(row_span(2, (3, 0), (7, 2), 80), (0, 7)); // last row → from left edge
+    }
+
+    #[test]
+    fn selection_text_extracts_and_trims() {
+        let buf = Buffer::with_lines(vec!["hello world   ", "second line   "]);
+        let w = buf.area.width;
+        // Single row, "hello".
+        assert_eq!(selection_text(&buf, (0, 0), (4, 0), w), "hello");
+        // Across rows: row0 from x6 to its (trimmed) end, then row0..=5 of row1.
+        assert_eq!(selection_text(&buf, (6, 0), (5, 1), w), "world\nsecond");
+    }
+
     #[test]
     fn tab_cycles_active_panel_then_wraps_to_none() {
         let mut app = cockpit_app();
+        app.show_thinking = true; // include the opt-in Thinking panel in the focus cycle
         assert!(app.active.is_none());
         app.cycle_panel(1);
         assert_eq!(app.active, Some(Panel::Activity));

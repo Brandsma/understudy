@@ -17,3 +17,4 @@ futures = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+arboard = { version = "3", default-features = false } # text-only; drops image-data deps
