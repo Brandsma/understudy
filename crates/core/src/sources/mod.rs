@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use crate::events::Event;
 
+pub mod antigravity;
 pub mod claude_code;
 pub mod opencode;
 
@@ -19,6 +20,7 @@ pub enum Agent {
     Copilot,
     Codex,
     GeminiCli,
+    Antigravity,
     Unknown,
 }
 
@@ -31,6 +33,7 @@ impl Agent {
             Agent::Copilot => "Copilot",
             Agent::Codex => "Codex",
             Agent::GeminiCli => "Gemini CLI",
+            Agent::Antigravity => "Antigravity",
             Agent::Unknown => "Unknown",
         }
     }
@@ -43,6 +46,7 @@ impl Agent {
             Agent::Copilot => "CP",
             Agent::Codex => "CX",
             Agent::GeminiCli => "GM",
+            Agent::Antigravity => "AG",
             Agent::Unknown => "??",
         }
     }
@@ -75,6 +79,7 @@ pub trait Source: Send {
 pub fn discover_all(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
     let mut out = claude_code::discover_sessions(cwd_filter);
     out.extend(opencode::discover_sessions(cwd_filter));
+    out.extend(antigravity::discover_sessions(cwd_filter));
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out
 }
@@ -83,6 +88,9 @@ pub fn discover_all(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
 pub fn open_source(info: &SessionInfo) -> Box<dyn Source + Send> {
     match info.agent {
         Agent::OpenCode => Box::new(opencode::OpenCodeSource::new(&info.path, &info.session_id)),
+        Agent::Antigravity => {
+            Box::new(antigravity::AntigravitySource::new(&info.path, &info.session_id))
+        }
         _ => Box::new(claude_code::ClaudeCodeSource::new(&info.path)),
     }
 }

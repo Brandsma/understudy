@@ -1158,6 +1158,7 @@ fn agent_color(agent: Agent) -> Color {
         Agent::Copilot => Color::Green,
         Agent::Codex => Color::Magenta,
         Agent::GeminiCli => Color::Blue,
+        Agent::Antigravity => Color::Rgb(138, 116, 249), // Antigravity violet
         Agent::Unknown => Color::DarkGray,
     }
 }
@@ -1170,6 +1171,7 @@ fn agent_glyph(agent: Agent) -> &'static str {
         Agent::Copilot => "\u{f09b}",    // github
         Agent::Codex => "\u{f120}",      // terminal
         Agent::GeminiCli => "\u{f1a0}",  // google
+        Agent::Antigravity => "\u{f135}", // rocket
         Agent::Unknown => "\u{f059}",    // question-circle
     }
 }
