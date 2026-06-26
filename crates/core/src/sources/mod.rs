@@ -9,6 +9,7 @@ use crate::events::Event;
 
 pub mod antigravity;
 pub mod claude_code;
+pub mod codex;
 pub mod copilot;
 pub mod opencode;
 
@@ -82,6 +83,7 @@ pub fn discover_all(cwd_filter: Option<&str>) -> Vec<SessionInfo> {
     out.extend(opencode::discover_sessions(cwd_filter));
     out.extend(copilot::discover_sessions(cwd_filter));
     out.extend(antigravity::discover_sessions(cwd_filter));
+    out.extend(codex::discover_sessions(cwd_filter));
     out.sort_by(|a, b| b.modified.cmp(&a.modified));
     out
 }
@@ -94,6 +96,7 @@ pub fn open_source(info: &SessionInfo) -> Box<dyn Source + Send> {
         Agent::Antigravity => {
             Box::new(antigravity::AntigravitySource::new(&info.path, &info.session_id))
         }
+        Agent::Codex => Box::new(codex::CodexSource::new(&info.path)),
         _ => Box::new(claude_code::ClaudeCodeSource::new(&info.path)),
     }
 }
