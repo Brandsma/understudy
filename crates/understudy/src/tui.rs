@@ -29,8 +29,8 @@ use understudy_core::events::{Event, EventKind, Hunk};
 use understudy_core::filters::{strip_think, ThinkFilter};
 use understudy_core::models::{build_provider, ChatMessage, Provider};
 use understudy_core::segments::{
-    boundaries_to_starts, build_segments_from_starts, parse_boundaries, parse_partial_boundaries,
-    segment_request_from, Segment,
+    batch_starts, build_segments_from_starts, parse_partial_boundaries, segment_batch_request,
+    Segment, BATCH_SIZE,
 };
 use understudy_core::sources::{discover_all, open_source, Agent, SessionInfo};
 use understudy_core::store::EventStore;
@@ -156,7 +156,8 @@ pub struct App {
     seg_map: Vec<usize>, // listing-line → event-index map for the in-flight request
     seg_total: usize,    // events handed to the in-flight segmentation (for progress)
     seg_progress: Vec<String>, // segment titles discovered so far while streaming
-    seg_frozen: Vec<(usize, String)>, // already-segmented blocks before the in-flight window
+    seg_frozen: Vec<(usize, String)>, // already-segmented blocks before the in-flight batch
+    seg_batch_start: usize, // event index the in-flight batch began at
     seg_watermark: usize, // events covered by the current segments (persisted; incremental base)
     auto_segment_pending: bool, // reconcile cache / segment history once backfill first arrives
     pending_cache: Option<session_cache::SessionCache>, // loaded cache, applied after backfill
@@ -214,6 +215,7 @@ impl App {
             seg_total: 0,
             seg_progress: Vec::new(),
             seg_frozen: Vec::new(),
+            seg_batch_start: 0,
             seg_watermark: 0,
             auto_segment_pending: false,
             pending_cache: None,
@@ -592,16 +594,10 @@ impl App {
 
     /// Segment incrementally from the start of the last block (extends it / adds new blocks),
     /// or do a full re-segmentation when `force`.
+    /// Kick off batched segmentation. `--force` discards existing segments and re-segments from
+    /// the start; otherwise it resumes from the watermark. Batches of [`BATCH_SIZE`] events
+    /// auto-chain in [`Self::on_seg_msg`] until the whole session is covered.
     fn start_segmentation(&mut self, force: bool, tx: &UnboundedSender<SegMsg>) {
-        let window_start = if force { 0 } else { self.segments.last().map_or(0, |s| s.start_idx) };
-        self.start_seg_from(window_start, tx);
-    }
-
-    /// Run segmentation over `events[window_start..]` as a detached stream. Blocks entirely
-    /// before the window are frozen (kept as-is, never re-sent to the model); the model only
-    /// re-decides the windowed tail. Segments are assembled once the reply arrives (see
-    /// [`Self::on_seg_msg`]).
-    fn start_seg_from(&mut self, window_start: usize, tx: &UnboundedSender<SegMsg>) {
         if self.segments_loading {
             return;
         }
@@ -609,20 +605,44 @@ impl App {
             self.chat_log.push(ChatEntry::system("No model configured — can't segment.".into()));
             return;
         }
-        let (messages, map) = segment_request_from(&self.store, window_start);
-        if map.is_empty() {
-            self.chat_log.push(ChatEntry::system("No activity to segment yet.".into()));
+        if force {
+            self.segments.clear();
+            self.segments_sel = None;
+            self.seg_watermark = 0;
+        }
+        if self.seg_watermark >= self.store.events.len() {
+            self.chat_log.push(ChatEntry::system("No new activity to segment yet.".into()));
             return;
         }
-        // The window may be capped to the most recent MAX_EVENTS; freeze every existing
-        // segment that starts before the first listed event.
-        let effective_start = map[0];
-        self.seg_frozen = self
-            .segments
-            .iter()
-            .filter(|s| s.start_idx < effective_start)
-            .map(|s| (s.start_idx, s.title.clone()))
-            .collect();
+        self.fire_batch(tx);
+    }
+
+    /// Run one batch — the next [`BATCH_SIZE`] events from the watermark — as a detached stream.
+    /// Existing segments are frozen; the model only decides where new work begins within the
+    /// batch (and whether the batch continues the previous segment). Leading events that produce
+    /// no listing are skipped forward without a model call. Assembled in [`Self::on_seg_msg`].
+    fn fire_batch(&mut self, tx: &UnboundedSender<SegMsg>) {
+        if self.segments_loading || self.provider.is_none() {
+            return;
+        }
+        let n = self.store.events.len();
+        let mut start = self.seg_watermark;
+        let (messages, map) = loop {
+            if start >= n {
+                self.seg_watermark = n;
+                self.persist_cache();
+                return;
+            }
+            let prev_title = self.segments.last().map(|s| s.title.clone());
+            let (messages, map) = segment_batch_request(&self.store, start, prev_title.as_deref());
+            if !map.is_empty() {
+                break (messages, map);
+            }
+            start = (start + BATCH_SIZE).min(n); // batch had no renderable events; skip ahead
+        };
+        // Freeze every existing segment; this batch only appends new boundaries beyond them.
+        self.seg_frozen = self.segments.iter().map(|s| (s.start_idx, s.title.clone())).collect();
+        self.seg_batch_start = start;
         self.seg_map = map;
         self.seg_total = self.seg_map.len();
         self.seg_progress.clear();
@@ -660,19 +680,26 @@ impl App {
         });
     }
 
-    fn on_seg_msg(&mut self, msg: SegMsg) {
+    fn on_seg_msg(&mut self, msg: SegMsg, tx: &UnboundedSender<SegMsg>) {
         match msg {
             SegMsg::Progress(titles) => self.seg_progress = titles,
             SegMsg::Done(raw) => {
                 self.segments_loading = false;
                 self.seg_progress.clear();
-                // Frozen blocks + the model's windowed boundaries → full segment list.
-                let mut starts = boundaries_to_starts(parse_boundaries(&raw), &self.seg_map);
+                // Frozen blocks + this batch's boundaries → full segment list. With a previous
+                // segment, the batch may add no boundary at its head, folding leading events into
+                // that segment; the first batch always anchors a start at 0.
+                let has_prev = !self.seg_frozen.is_empty();
+                let mut starts = batch_starts(&raw, &self.seg_map, has_prev);
                 starts.append(&mut self.seg_frozen);
                 self.segments = build_segments_from_starts(starts, &self.store);
                 self.segments_sel = None;
-                self.seg_watermark = self.store.events.len();
+                let n = self.store.events.len();
+                self.seg_watermark = (self.seg_batch_start + BATCH_SIZE).min(n);
                 self.persist_cache();
+                if self.seg_watermark < n {
+                    self.fire_batch(tx); // auto-chain to the next batch
+                }
             }
             SegMsg::Error(e) => {
                 self.segments_loading = false;
@@ -1162,7 +1189,7 @@ async fn event_loop(terminal: &mut DefaultTerminal) -> Result<()> {
             }
             Some(msg) = chat_rx.recv() => app.on_chat_msg(msg),
             Some(msg) = sum_rx.recv() => app.on_summary_msg(msg),
-            Some(msg) = seg_rx.recv() => app.on_seg_msg(msg),
+            Some(msg) = seg_rx.recv() => app.on_seg_msg(msg, &channels.seg),
             Some(msg) = tag_rx.recv() => app.on_tag_msg(msg),
             Some(msg) = explain_rx.recv() => app.on_explain_msg(msg),
             _ = tick.tick() => {}
@@ -1707,26 +1734,7 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageR
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.segments_loading {
-        let width = inner.width.saturating_sub(5) as usize;
-        let mut lines = vec![Line::styled(
-            format!("⟳ segmenting {} events · {} found", app.seg_total, app.seg_progress.len()),
-            Style::default().fg(Color::Yellow),
-        )];
-        if app.seg_progress.is_empty() {
-            lines.push(Line::styled("  reading the activity log…", Style::default().fg(Color::DarkGray)));
-        } else {
-            for (i, t) in app.seg_progress.iter().enumerate() {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} ", i + 1), Style::default().fg(Color::DarkGray)),
-                    Span::raw(truncate(t, width)),
-                ]));
-            }
-        }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
-        return;
-    }
-    if app.segments.is_empty() {
+    if app.segments.is_empty() && !app.segments_loading {
         f.render_widget(
             Paragraph::new("(none yet — /segments)").style(Style::default().fg(Color::DarkGray)),
             inner,
@@ -1734,7 +1742,8 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageR
         return;
     }
     let width = inner.width.saturating_sub(5) as usize;
-    let items: Vec<ListItem> = app
+    // Committed segments accumulate as batches land; a footer shows the in-flight batch.
+    let mut items: Vec<ListItem> = app
         .segments
         .iter()
         .enumerate()
@@ -1753,6 +1762,24 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageR
             }
         })
         .collect();
+    if app.segments_loading {
+        items.push(ListItem::new(Line::styled(
+            format!("⟳ segmenting next {} events · {} found", app.seg_total, app.seg_progress.len()),
+            Style::default().fg(Color::Yellow),
+        )));
+        if app.seg_progress.is_empty() {
+            items.push(ListItem::new(Line::styled(
+                "  reading the activity log…",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for t in &app.seg_progress {
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(truncate(t, width)),
+            ])));
+        }
+    }
     f.render_widget(List::new(items), inner);
 }
 
@@ -2623,7 +2650,8 @@ mod tests {
         let mut app = cockpit_app();
         app.seg_map = (0..app.store.events.len()).collect();
         app.segments_loading = true;
-        app.on_seg_msg(SegMsg::Done("[{\"start\":0,\"title\":\"All\"}]".into()));
+        let (seg_tx, _r) = mpsc::unbounded_channel::<SegMsg>();
+        app.on_seg_msg(SegMsg::Done("[{\"start\":0,\"title\":\"All\"}]".into()), &seg_tx);
         assert!(!app.segments_loading);
         assert_eq!(app.segments.len(), 1);
         assert_eq!(app.segments[0].title, "All");

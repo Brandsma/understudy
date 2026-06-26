@@ -13,8 +13,11 @@ use crate::models::{complete, ChatMessage, Provider, ProviderError};
 use crate::store::EventStore;
 use crate::events::EventKind;
 
-/// Most recent events fed to the segmenter (bounds cost on long sessions).
-const MAX_EVENTS: usize = 400;
+/// Events sent to the segmenter per incremental batch. Small batches keep each model call
+/// cheap and fast and let segments stream in progressively as a session grows, at the cost of
+/// more (sequential) calls. Each batch may only show part of a session, so the prompt tells the
+/// model the batch can be a continuation of the previous segment.
+pub const BATCH_SIZE: usize = 20;
 
 /// One coherent block of work, with deterministic stats over `[start_idx, end_idx)`.
 #[derive(Debug, Clone)]
@@ -36,61 +39,91 @@ distinct pieces of work it represents. Each segment is one coherent task or goal
 whenever the agent shifts focus — to a different feature or bug, a different area of the codebase, or a \
 different phase of work (e.g. exploring → implementing, implementing → fixing tests, one feature → the next).";
 
-const SEG_PROMPT: &str = "Below is a numbered activity log, one line per event. Split it into contiguous \
-segments that each capture one coherent piece of work.\n\
+/// The per-batch user prompt. A batch is a numbered slice that may only show part of a session,
+/// so `prev_title` names the segment the slice might continue (None only for the first slice,
+/// which must open a segment at line 0).
+fn seg_batch_prompt(prev_title: Option<&str>) -> String {
+    let context = match prev_title {
+        Some(t) => format!(
+            "This slice may begin in the MIDDLE of an ongoing session: the events before line 0 are \
+already grouped into a segment titled \"{t}\". If the first events here continue that same work, do \
+NOT emit a boundary for them — only emit a boundary where genuinely new work begins. If the ENTIRE \
+slice continues that segment, return an empty array [].",
+        ),
+        None => "This is the START of the session, so your first boundary must be at line 0.".to_string(),
+    };
+    format!(
+        "Below is a numbered slice of a coding agent's activity log, one line per event. {context}\n\
+Mark where the work shifts to a NEW coherent piece of work — a different feature or bug, a different \
+area of the codebase, or a different phase (e.g. exploring \u{2192} implementing, implementing \u{2192} \
+fixing tests). A short slice may be entirely one piece of work; only add a boundary at a real shift, \
+not at arbitrary intervals.\n\
 Rules:\n\
-- Return ONLY a JSON array, no prose and no markdown fences. Each element is {\"start\": <0-based line \
-number where the segment begins>, \"title\": \"<3-6 word description of that work>\"}.\n\
-- Segments must be in order, non-overlapping, and the first must start at line 0.\n\
-- Never return a single segment that covers the whole log.\n\
-- Title each segment with the concrete work it contains, e.g. \"Refactor event store\", \"Fix failing port \
-tests\", \"Add segmentation cache\". Never use vague catch-all titles like \"Session\", \"Whole session\", \
-\"Coding\", or \"Misc\".\n\
-- Place boundaries at real shifts in work, not at arbitrary intervals.";
+- Return ONLY a JSON array, no prose and no markdown fences. Each element is {{\"start\": <0-based line \
+number where a new segment begins>, \"title\": \"<3-6 word description of that work>\"}}. An empty array \
+[] is allowed.\n\
+- Boundaries must be in order and non-overlapping.\n\
+- Title each segment with the concrete work it contains, e.g. \"Refactor event store\", \"Fix failing \
+port tests\", \"Add segmentation cache\". Never use vague catch-all titles like \"Session\", \"Coding\", \
+or \"Misc\"."
+    )
+}
 
-/// Segment the session by asking the configured model for boundaries, then computing
-/// stats deterministically. On any model/parse failure the session degrades to a
-/// single "whole session" block rather than erroring.
+/// Segment the session by asking the configured model for boundaries in batches of
+/// [`BATCH_SIZE`] events, then computing stats deterministically. Each batch is told whether it
+/// continues the previous segment, so leading events can fold into it instead of forcing a new
+/// block. On any model/parse failure the session degrades to a single block rather than erroring.
 pub async fn segment_session(provider: &Provider, store: &EventStore) -> Result<Vec<Segment>, ProviderError> {
-    let (messages, map) = segment_request(store);
-    if map.is_empty() {
+    let n = store.events.len();
+    if n == 0 {
         return Ok(Vec::new());
     }
-    let raw = complete(provider, messages).await?;
-    Ok(build_segments(parse_boundaries(&raw), &map, store))
+    let mut starts: Vec<(usize, String)> = Vec::new();
+    let mut pos = 0;
+    while pos < n {
+        let prev_title = starts.last().map(|(_, t)| t.clone());
+        let (messages, map) = segment_batch_request(store, pos, prev_title.as_deref());
+        if !map.is_empty() {
+            let raw = complete(provider, messages).await?;
+            let mut batch = batch_starts(&raw, &map, prev_title.is_some());
+            starts.append(&mut batch);
+        }
+        pos += BATCH_SIZE;
+    }
+    if starts.is_empty() {
+        starts.push((0, "Unsegmented activity".to_string()));
+    }
+    Ok(build_segments_from_starts(starts, store))
 }
 
-/// Build the segmentation prompt plus the listing-line → event-index map. Exposed so a
-/// caller (e.g. the TUI) can run the request as a detached `'static` stream and then call
-/// [`build_segments`] with the (still valid, append-only) `map` once the reply arrives.
-pub fn segment_request(store: &EventStore) -> (Vec<ChatMessage>, Vec<usize>) {
-    segment_request_from(store, 0)
-}
-
-/// Like [`segment_request`] but only lists events from `start_idx` onward (still capped to
-/// the most recent [`MAX_EVENTS`]). Used for incremental segmentation: everything before
-/// `start_idx` is already segmented and frozen, so it isn't re-sent to the model.
-pub fn segment_request_from(store: &EventStore, start_idx: usize) -> (Vec<ChatMessage>, Vec<usize>) {
-    let (listing, map) = segment_input(store, start_idx, MAX_EVENTS);
+/// Build the prompt + listing-line → event-index map for one incremental batch: up to
+/// [`BATCH_SIZE`] events starting at `start_idx`. `prev_title` is the segment the batch may be
+/// continuing (None for the first batch, which must open a segment at line 0). Exposed so the
+/// TUI can run the request as a detached `'static` stream and assemble segments once it arrives.
+pub fn segment_batch_request(
+    store: &EventStore,
+    start_idx: usize,
+    prev_title: Option<&str>,
+) -> (Vec<ChatMessage>, Vec<usize>) {
+    let end = (start_idx + BATCH_SIZE).min(store.events.len());
+    let (listing, map) = segment_listing(store, start_idx, end);
     if map.is_empty() {
         return (Vec::new(), map);
     }
     let messages = vec![
         ChatMessage::system(SEG_SYS),
-        ChatMessage::user(format!("{SEG_PROMPT}\n\n=== ACTIVITY ===\n{listing}")),
+        ChatMessage::user(format!("{}\n\n=== ACTIVITY ===\n{listing}", seg_batch_prompt(prev_title))),
     ];
     (messages, map)
 }
 
-/// Render events `[start_idx, len)` (clamped to the most recent `max_events`) as a numbered
-/// listing for the prompt, plus the parallel map from listing line number (0-based) → index
-/// into `store.events`, so a model-returned boundary maps back to a real event.
-fn segment_input(store: &EventStore, start_idx: usize, max_events: usize) -> (String, Vec<usize>) {
-    let cap_start = store.events.len().saturating_sub(max_events);
-    let start = start_idx.max(cap_start);
+/// Render events `[start, end)` as a numbered listing for the prompt, plus the parallel map
+/// from listing line number (0-based) → index into `store.events`, so a model-returned boundary
+/// maps back to a real event. Events with no renderable line are skipped (and not mapped).
+fn segment_listing(store: &EventStore, start: usize, end: usize) -> (String, Vec<usize>) {
     let mut lines = Vec::new();
     let mut map = Vec::new();
-    for (i, ev) in store.events.iter().enumerate().skip(start) {
+    for (i, ev) in store.events.iter().enumerate().take(end).skip(start) {
         let line = event_line(ev);
         if line.is_empty() {
             continue;
@@ -156,6 +189,28 @@ pub fn build_segments(pairs: Vec<(usize, String)>, map: &[usize], store: &EventS
 /// cover the whole listed range contiguously).
 pub fn boundaries_to_starts(pairs: Vec<(usize, String)>, map: &[usize]) -> Vec<(usize, String)> {
     normalize(pairs, map.len()).into_iter().map(|(line, title)| (map[line], title)).collect()
+}
+
+/// Parse a model reply into absolute event-index starts for one batch. `has_prev` selects the
+/// continuation semantics: with a previous segment, no synthetic start-at-0 is injected, so
+/// leading events with no boundary fold into the previous (frozen) segment; without one (the
+/// first batch) a start at line 0 is guaranteed.
+pub fn batch_starts(raw: &str, map: &[usize], has_prev: bool) -> Vec<(usize, String)> {
+    let pairs = parse_boundaries(raw);
+    if has_prev {
+        batch_boundaries_to_starts(pairs, map)
+    } else {
+        boundaries_to_starts(pairs, map)
+    }
+}
+
+/// Like [`boundaries_to_starts`] but without the synthetic start-at-0 (used for continuation
+/// batches). Out-of-range lines are dropped; starts are sorted and deduped.
+pub fn batch_boundaries_to_starts(pairs: Vec<(usize, String)>, map: &[usize]) -> Vec<(usize, String)> {
+    let mut pairs: Vec<(usize, String)> = pairs.into_iter().filter(|(s, _)| *s < map.len()).collect();
+    pairs.sort_by_key(|(s, _)| *s);
+    pairs.dedup_by_key(|(s, _)| *s);
+    pairs.into_iter().map(|(line, title)| (map[line], title)).collect()
 }
 
 /// Build contiguous segments from absolute event-index starts (each segment runs to the
@@ -262,6 +317,11 @@ mod tests {
         store
     }
 
+    /// Test shim: render the whole store as a listing (the batch lister bounds real runs).
+    fn segment_input(store: &EventStore, start: usize, _max: usize) -> (String, Vec<usize>) {
+        segment_listing(store, start, store.events.len())
+    }
+
     #[test]
     fn single_segment_covers_all_and_matches_store_totals() {
         let store = fixture_store();
@@ -352,15 +412,39 @@ mod tests {
     }
 
     #[test]
-    fn segment_request_builds_prompt_and_index_map() {
+    fn segment_batch_request_builds_prompt_and_index_map() {
         let store = fixture_store();
-        let (messages, map) = segment_request(&store);
+        let (messages, map) = segment_batch_request(&store, 0, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert!(messages[1].content.contains("=== ACTIVITY ==="));
-        // Map has one entry per listed (non-empty) event, each a valid event index.
+        assert!(messages[1].content.contains("START of the session")); // None → first-batch framing
+        // Map has one entry per listed (non-empty) event, each a valid index, capped to a batch.
         assert!(!map.is_empty());
+        assert!(map.len() <= BATCH_SIZE);
         assert!(map.iter().all(|&i| i < store.events.len()));
+    }
+
+    #[test]
+    fn batch_prompt_frames_continuation_vs_first_slice() {
+        let cont = seg_batch_prompt(Some("Refactor store"));
+        assert!(cont.contains("Refactor store"));
+        assert!(cont.contains("empty array")); // may fold entirely into the previous segment
+        assert!(seg_batch_prompt(None).contains("START of the session"));
+    }
+
+    #[test]
+    fn batch_starts_continuation_skips_forced_zero() {
+        // listing-line → event-index map for a mid-session batch.
+        let map = vec![10, 11, 12, 13];
+        // Continuation: a boundary at line 2 only; leading lines fold into the previous segment.
+        let cont = batch_starts("[{\"start\":2,\"title\":\"New work\"}]", &map, true);
+        assert_eq!(cont, vec![(12, "New work".to_string())]);
+        // Whole batch continues the previous segment → no new starts at all.
+        assert!(batch_starts("[]", &map, true).is_empty());
+        // First batch (no previous segment) still guarantees a leading start at the window head.
+        let first = batch_starts("[{\"start\":2,\"title\":\"New work\"}]", &map, false);
+        assert_eq!(first[0].0, map[0]);
     }
 
     #[test]
