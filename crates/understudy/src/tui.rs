@@ -154,10 +154,12 @@ pub struct App {
     segments_sel: Option<usize>,
     segments_loading: bool,
     seg_map: Vec<usize>, // listing-line → event-index map for the in-flight request
-    seg_total: usize,    // events handed to the in-flight segmentation (for progress)
     seg_progress: Vec<String>, // segment titles discovered so far while streaming
     seg_frozen: Vec<(usize, String)>, // already-segmented blocks before the in-flight batch
     seg_batch_start: usize, // event index the in-flight batch began at
+    seg_batch_started_at: Option<Instant>, // when the in-flight batch's model call began
+    seg_elapsed: Duration, // cumulative model time across completed batches in this run
+    seg_batches_done: usize, // completed batches in this run (for the average)
     seg_watermark: usize, // events covered by the current segments (persisted; incremental base)
     auto_segment_pending: bool, // reconcile cache / segment history once backfill first arrives
     pending_cache: Option<session_cache::SessionCache>, // loaded cache, applied after backfill
@@ -212,10 +214,12 @@ impl App {
             segments_sel: None,
             segments_loading: false,
             seg_map: Vec::new(),
-            seg_total: 0,
             seg_progress: Vec::new(),
             seg_frozen: Vec::new(),
             seg_batch_start: 0,
+            seg_batch_started_at: None,
+            seg_elapsed: Duration::ZERO,
+            seg_batches_done: 0,
             seg_watermark: 0,
             auto_segment_pending: false,
             pending_cache: None,
@@ -322,9 +326,11 @@ impl App {
         self.segments_sel = None;
         self.segments_loading = false;
         self.seg_map.clear();
-        self.seg_total = 0;
         self.seg_progress.clear();
         self.seg_frozen.clear();
+        self.seg_batch_started_at = None;
+        self.seg_elapsed = Duration::ZERO;
+        self.seg_batches_done = 0;
         self.seg_watermark = 0;
         self.auto_segment_pending = true; // reconcile cache / segment history once backfill lands
         self.interactions = Interactions::new();
@@ -614,6 +620,9 @@ impl App {
             self.chat_log.push(ChatEntry::system("No new activity to segment yet.".into()));
             return;
         }
+        // Fresh run: reset the per-batch timing used for the progress average.
+        self.seg_elapsed = Duration::ZERO;
+        self.seg_batches_done = 0;
         self.fire_batch(tx);
     }
 
@@ -644,8 +653,8 @@ impl App {
         self.seg_frozen = self.segments.iter().map(|s| (s.start_idx, s.title.clone())).collect();
         self.seg_batch_start = start;
         self.seg_map = map;
-        self.seg_total = self.seg_map.len();
         self.seg_progress.clear();
+        self.seg_batch_started_at = Some(Instant::now());
         self.segments_loading = true;
         let stream = self.provider.as_ref().unwrap().stream_chat(messages);
         let tx = tx.clone();
@@ -686,6 +695,10 @@ impl App {
             SegMsg::Done(raw) => {
                 self.segments_loading = false;
                 self.seg_progress.clear();
+                if let Some(t0) = self.seg_batch_started_at.take() {
+                    self.seg_elapsed += t0.elapsed();
+                    self.seg_batches_done += 1;
+                }
                 // Frozen blocks + this batch's boundaries → full segment list. With a previous
                 // segment, the batch may add no boundary at its head, folding leading events into
                 // that segment; the first batch always anchors a start at 0.
@@ -1763,10 +1776,18 @@ fn draw_segments(f: &mut Frame, app: &App, area: Rect, report: Option<&CoverageR
         })
         .collect();
     if app.segments_loading {
-        items.push(ListItem::new(Line::styled(
-            format!("⟳ segmenting next {} events · {} found", app.seg_total, app.seg_progress.len()),
-            Style::default().fg(Color::Yellow),
-        )));
+        let n = app.store.events.len();
+        let batch_end = (app.seg_batch_start + BATCH_SIZE).min(n);
+        let mut head = format!("⟳ segmenting {batch_end}/{n} events");
+        if app.seg_batches_done > 0 {
+            let avg = app.seg_elapsed.as_secs_f32() / app.seg_batches_done as f32;
+            head.push_str(&format!(" · {avg:.1}s/batch"));
+            let remaining = n.saturating_sub(batch_end).div_ceil(BATCH_SIZE);
+            if remaining > 0 {
+                head.push_str(&format!(" · ~{}s left", (remaining as f32 * avg).ceil() as u64));
+            }
+        }
+        items.push(ListItem::new(Line::styled(head, Style::default().fg(Color::Yellow))));
         if app.seg_progress.is_empty() {
             items.push(ListItem::new(Line::styled(
                 "  reading the activity log…",
