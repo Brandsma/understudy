@@ -21,7 +21,6 @@ pub enum Agent {
     OpenCode,
     Copilot,
     Codex,
-    GeminiCli,
     Antigravity,
     Unknown,
 }
@@ -34,7 +33,6 @@ impl Agent {
             Agent::OpenCode => "OpenCode",
             Agent::Copilot => "Copilot",
             Agent::Codex => "Codex",
-            Agent::GeminiCli => "Gemini CLI",
             Agent::Antigravity => "Antigravity",
             Agent::Unknown => "Unknown",
         }
@@ -47,7 +45,6 @@ impl Agent {
             Agent::OpenCode => "OC",
             Agent::Copilot => "CP",
             Agent::Codex => "CX",
-            Agent::GeminiCli => "GM",
             Agent::Antigravity => "AG",
             Agent::Unknown => "??",
         }

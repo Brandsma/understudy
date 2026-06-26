@@ -276,12 +276,11 @@ impl App {
     /// Agents present in the session list, in canonical order (drives the Tab cycle so it
     /// never lands on an agent with zero sessions).
     fn present_agents(&self) -> Vec<Agent> {
-        const ORDER: [Agent; 7] = [
+        const ORDER: [Agent; 6] = [
             Agent::ClaudeCode,
             Agent::OpenCode,
             Agent::Copilot,
             Agent::Codex,
-            Agent::GeminiCli,
             Agent::Antigravity,
             Agent::Unknown,
         ];
@@ -1501,7 +1500,6 @@ fn agent_color(agent: Agent) -> Color {
         Agent::OpenCode => Color::Cyan,
         Agent::Copilot => Color::Green,
         Agent::Codex => Color::Magenta,
-        Agent::GeminiCli => Color::Blue,
         Agent::Antigravity => Color::Rgb(138, 116, 249), // Antigravity violet
         Agent::Unknown => Color::DarkGray,
     }
@@ -1514,7 +1512,6 @@ fn agent_glyph(agent: Agent) -> &'static str {
         Agent::OpenCode => "\u{f121}",   // code
         Agent::Copilot => "\u{f09b}",    // github
         Agent::Codex => "\u{f120}",      // terminal
-        Agent::GeminiCli => "\u{f1a0}",  // google
         Agent::Antigravity => "\u{f135}", // rocket
         Agent::Unknown => "\u{f059}",    // question-circle
     }
